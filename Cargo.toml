@@ -1,0 +1,26 @@
+[package]
+name = "energy-core"
+version = "0.1.0"
+edition = "2021"
+description = "Moteur de simulation energetique deterministe (FOSS) pour jeu de gestion : physique eolien / solaire / hydro / thermique / stockage, dispatch et economie."
+license = "AGPL-3.0-or-later"
+repository = "https://example.invalid/energy-core"
+
+[lib]
+# rlib pour l'usage natif (Godot/Bevy/tests), cdylib pour la cible WASM.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+# Dependances tirees uniquement avec --features wasm (build web).
+wasm-bindgen = { version = "0.2", optional = true }
+serde-wasm-bindgen = { version = "0.6", optional = true }
+
+[features]
+default = []
+wasm = ["dep:wasm-bindgen", "dep:serde-wasm-bindgen"]
+
+[profile.release]
+opt-level = "z"
+lto = true
