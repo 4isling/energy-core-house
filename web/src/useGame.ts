@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createGame, initEngine, type Game } from "./engine";
-import type { ApplianceView, ResidentView, TickReport } from "./types";
+import type { BuildingView, TickReport } from "./types";
 
 const DT_H = 0.5; // chaque tick avance la sim de 30 min
 const TICK_MS = 250; // 4 ticks/seconde
@@ -10,8 +10,7 @@ export interface GameApi {
   ready: boolean;
   report: TickReport | null;
   history: TickReport[];
-  appliances: ApplianceView[];
-  residents: ResidentView[];
+  buildings: BuildingView[];
   paused: boolean;
   gridConnected: boolean;
   togglePause: () => void;
@@ -20,9 +19,10 @@ export interface GameApi {
   buildWindMicro: () => void;
   buildBattery: (kwh: number) => void;
   buildGenset: () => void;
-  addAppliance: (code: string) => void;
+  buildBuilding: (code: string) => void;
+  addApplianceTo: (buildingId: number, code: string) => void;
   toggleAppliance: (id: number) => void;
-  addResident: (name: string, profile: string) => void;
+  addResidentTo: (buildingId: number, name: string, profile: string) => void;
 }
 
 export function useGame(budget: number, seed: number): GameApi {
@@ -30,17 +30,15 @@ export function useGame(budget: number, seed: number): GameApi {
   const [ready, setReady] = useState(false);
   const [report, setReport] = useState<TickReport | null>(null);
   const [history, setHistory] = useState<TickReport[]>([]);
-  const [appliances, setAppliances] = useState<ApplianceView[]>([]);
-  const [residents, setResidents] = useState<ResidentView[]>([]);
+  const [buildings, setBuildings] = useState<BuildingView[]>([]);
   const [paused, setPaused] = useState(false);
   const [gridConnected, setGridConnectedState] = useState(true);
 
-  // Rafraîchit les listes (appareils/habitants) depuis le cœur.
-  const refreshLists = useCallback(() => {
+  // Rafraîchit le détail des bâtiments (appareils/habitants) depuis le cœur.
+  const refreshBuildings = useCallback(() => {
     const g = gameRef.current;
     if (!g) return;
-    setAppliances(g.list_appliances() as ApplianceView[]);
-    setResidents(g.list_residents() as ResidentView[]);
+    setBuildings(g.list_buildings() as BuildingView[]);
   }, []);
 
   useEffect(() => {
@@ -49,12 +47,12 @@ export function useGame(budget: number, seed: number): GameApi {
       if (cancelled) return;
       gameRef.current = createGame(budget, seed);
       setReady(true);
-      refreshLists();
+      refreshBuildings();
     });
     return () => {
       cancelled = true;
     };
-  }, [budget, seed, refreshLists]);
+  }, [budget, seed, refreshBuildings]);
 
   // Boucle de jeu.
   useEffect(() => {
@@ -69,10 +67,10 @@ export function useGame(budget: number, seed: number): GameApi {
         next.push(r);
         return next;
       });
-      refreshLists(); // les habitants ont pu changer l'état des appareils
+      refreshBuildings(); // les habitants ont pu changer l'état des appareils
     }, TICK_MS);
     return () => clearInterval(handle);
-  }, [ready, paused, refreshLists]);
+  }, [ready, paused, refreshBuildings]);
 
   const togglePause = useCallback(() => setPaused((p) => !p), []);
 
@@ -93,35 +91,41 @@ export function useGame(budget: number, seed: number): GameApi {
   const buildGenset = useCallback(() => {
     gameRef.current?.build_genset();
   }, []);
-
-  const addAppliance = useCallback(
+  const buildBuilding = useCallback(
     (code: string) => {
-      gameRef.current?.add_appliance(code);
-      refreshLists();
+      gameRef.current?.build_building(code);
+      refreshBuildings();
     },
-    [refreshLists],
+    [refreshBuildings],
+  );
+
+  const addApplianceTo = useCallback(
+    (buildingId: number, code: string) => {
+      gameRef.current?.add_appliance_to(buildingId, code);
+      refreshBuildings();
+    },
+    [refreshBuildings],
   );
   const toggleAppliance = useCallback(
     (id: number) => {
       gameRef.current?.toggle_appliance(id);
-      refreshLists();
+      refreshBuildings();
     },
-    [refreshLists],
+    [refreshBuildings],
   );
-  const addResident = useCallback(
-    (name: string, profile: string) => {
-      gameRef.current?.add_resident(name, profile);
-      refreshLists();
+  const addResidentTo = useCallback(
+    (buildingId: number, name: string, profile: string) => {
+      gameRef.current?.add_resident_to(buildingId, name, profile);
+      refreshBuildings();
     },
-    [refreshLists],
+    [refreshBuildings],
   );
 
   return {
     ready,
     report,
     history,
-    appliances,
-    residents,
+    buildings,
     paused,
     gridConnected,
     togglePause,
@@ -130,8 +134,9 @@ export function useGame(budget: number, seed: number): GameApi {
     buildWindMicro,
     buildBattery,
     buildGenset,
-    addAppliance,
+    buildBuilding,
+    addApplianceTo,
     toggleAppliance,
-    addResident,
+    addResidentTo,
   };
 }

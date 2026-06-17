@@ -4,6 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::building::BuildingKind;
 use crate::physics::{FuelKind, HydroTurbine, SolarArray, ThermalPlant, WindTurbine};
 
 /// CAPEX d'une éolienne (€), ~1850 €/kW installé.
@@ -25,6 +26,17 @@ pub fn capex_thermal(t: &ThermalPlant) -> f64 {
 /// CAPEX batterie (€), ~600 €/kWh.
 pub fn capex_battery_per_kwh() -> f64 {
     600.0
+}
+
+/// CAPEX d'un bâtiment du village (€) : raccordement au micro-réseau +
+/// équipement du foyer. Ordre de grandeur d'un logement neuf raccordé, modulé
+/// par la taille du foyer.
+pub fn capex_building(kind: BuildingKind) -> f64 {
+    match kind {
+        BuildingKind::Studio => 8_000.0,
+        BuildingKind::Family => 14_000.0,
+        BuildingKind::Elders => 11_000.0,
+    }
 }
 
 /// OPEX annuel d'une éolienne (€/an).

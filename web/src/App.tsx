@@ -2,9 +2,9 @@ import { useGame } from "./useGame";
 import { Dashboard } from "./components/Dashboard";
 import { ProductionChart } from "./components/ProductionChart";
 import { BuildMenu } from "./components/BuildMenu";
-import { HouseSchematic } from "./components/HouseSchematic";
+import { ColonyView } from "./components/ColonyView";
 
-const STARTING_BUDGET = 40_000; // € — échelle maison
+const STARTING_BUDGET = 120_000; // € — échelle village (plusieurs foyers + réseau)
 const SEED = 1234;
 
 export function App() {
@@ -17,7 +17,7 @@ export function App() {
   return (
     <div className="app">
       <header className="app-header">
-        <h1>🏡 Maison autonome</h1>
+        <h1>🏘️ Village énergie</h1>
         <div className="header-controls">
           <button onClick={game.togglePause}>
             {game.paused ? "▶︎ Reprendre" : "⏸ Pause"}
@@ -33,11 +33,11 @@ export function App() {
         </div>
       </header>
 
-      <Dashboard report={game.report} residents={game.residents} />
+      <Dashboard report={game.report} />
 
       <div className="main-grid">
         <div className="left-col">
-          <HouseSchematic report={game.report} residents={game.residents} />
+          <ColonyView report={game.report} />
           <ProductionChart history={game.history} />
         </div>
         <BuildMenu game={game} budget={game.report.budget_eur} />

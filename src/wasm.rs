@@ -6,6 +6,7 @@
 use wasm_bindgen::prelude::*;
 
 use crate::appliance::ApplianceKind;
+use crate::building::BuildingKind;
 use crate::physics::{FuelKind, HydroKind, HydroTurbine, SolarArray, ThermalPlant, WindTurbine};
 use crate::resident::ResidentProfile;
 use crate::sim::{SimState, TickReport};
@@ -35,6 +36,16 @@ fn parse_profile(code: &str) -> Option<ResidentProfile> {
     })
 }
 
+/// Mappe un code texte vers un type de bâtiment.
+fn parse_building_kind(code: &str) -> Option<BuildingKind> {
+    Some(match code {
+        "studio" => BuildingKind::Studio,
+        "family" => BuildingKind::Family,
+        "elders" => BuildingKind::Elders,
+        _ => return None,
+    })
+}
+
 #[wasm_bindgen]
 pub struct Game {
     sim: SimState,
@@ -45,10 +56,10 @@ pub struct Game {
 impl Game {
     #[wasm_bindgen(constructor)]
     pub fn new(starting_budget_eur: f64, seed: u32) -> Game {
-        Game {
-            sim: SimState::new(starting_budget_eur),
-            weather: ProceduralWeather::new(seed as u64),
-        }
+        let mut sim = SimState::new(starting_budget_eur);
+        // Village de départ : quelques foyers déjà habités (gratuit, état initial).
+        sim.seed_starter_village();
+        Game { sim, weather: ProceduralWeather::new(seed as u64) }
     }
 
     /// Avance d'un pas, génère la météo en interne, renvoie le `TickReport`.
@@ -106,44 +117,50 @@ impl Game {
         self.sim.build_battery(capacity_kwh)
     }
 
-    // --- Appareils consommateurs ---
+    // --- Bâtiments du village ---
 
-    /// Ajoute un appareil (`code` : "fridge", "lighting", "heating",
-    /// "water_heater", "washing_machine", "oven", "ev_charger").
-    /// Renvoie l'id de l'appareil, ou -1 si le code est inconnu.
-    pub fn add_appliance(&mut self, code: &str) -> i32 {
-        match parse_appliance_kind(code) {
-            Some(kind) => self.sim.add_appliance(kind) as i32,
+    /// Construit un bâtiment (`code` : "studio", "family", "elders") en débitant
+    /// le CAPEX. Renvoie l'id du bâtiment, ou -1 si le code est inconnu ou le
+    /// budget insuffisant.
+    pub fn build_building(&mut self, code: &str) -> i32 {
+        match parse_building_kind(code) {
+            Some(kind) => self.sim.build_building(kind).map(|id| id as i32).unwrap_or(-1),
             None => -1,
         }
     }
-    /// Bascule on/off d'un appareil. Renvoie false si l'id est inconnu.
+    /// Liste détaillée des bâtiments (objets JS : id, kind, name, appliances,
+    /// residents, load_kw…).
+    pub fn list_buildings(&self) -> Result<JsValue, JsValue> {
+        serde_wasm_bindgen::to_value(&self.sim.buildings)
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    // --- Appareils consommateurs (scopés par bâtiment) ---
+
+    /// Ajoute un appareil à un bâtiment (`code` : "fridge", "lighting",
+    /// "heating", "water_heater", "washing_machine", "oven", "ev_charger").
+    /// Renvoie l'id de l'appareil, ou -1 si code/bâtiment inconnu.
+    pub fn add_appliance_to(&mut self, building_id: u32, code: &str) -> i32 {
+        match parse_appliance_kind(code) {
+            Some(kind) => self.sim.add_appliance_to(building_id, kind).map(|id| id as i32).unwrap_or(-1),
+            None => -1,
+        }
+    }
+    /// Bascule on/off d'un appareil par son id (unique dans le village).
+    /// Renvoie false si l'id est inconnu.
     pub fn toggle_appliance(&mut self, id: u32) -> bool {
         self.sim.toggle_appliance(id)
     }
-    /// Liste des appareils (objets JS : id, kind, name, power_kw, on).
-    pub fn list_appliances(&self) -> Result<JsValue, JsValue> {
-        serde_wasm_bindgen::to_value(&self.sim.park.appliances)
-            .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
 
-    // --- Habitants (NPC) ---
+    // --- Habitants (NPC, scopés par bâtiment) ---
 
-    /// Ajoute un habitant (`profile` : "worker", "retiree", "teenager").
-    /// Renvoie false si le profil est inconnu.
-    pub fn add_resident(&mut self, name: &str, profile: &str) -> bool {
+    /// Ajoute un habitant à un bâtiment (`profile` : "worker", "retiree",
+    /// "teenager"). Renvoie false si le profil ou le bâtiment est inconnu.
+    pub fn add_resident_to(&mut self, building_id: u32, name: &str, profile: &str) -> bool {
         match parse_profile(profile) {
-            Some(p) => {
-                self.sim.add_resident(name, p);
-                true
-            }
+            Some(p) => self.sim.add_resident_to(building_id, name, p),
             None => false,
         }
-    }
-    /// Liste des habitants (objets JS : name, profile, comfort).
-    pub fn list_residents(&self) -> Result<JsValue, JsValue> {
-        serde_wasm_bindgen::to_value(&self.sim.park.residents)
-            .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
     pub fn budget_eur(&self) -> f64 {

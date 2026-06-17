@@ -1,4 +1,4 @@
-import type { ResidentView, TickReport } from "../types";
+import type { TickReport } from "../types";
 
 function fmtHour(hour: number): string {
   const h = Math.floor(hour);
@@ -10,13 +10,7 @@ function fmtEur(v: number): string {
   return v.toLocaleString("fr-FR", { maximumFractionDigits: 0 }) + " €";
 }
 
-export function Dashboard({
-  report,
-  residents,
-}: {
-  report: TickReport;
-  residents: ResidentView[];
-}) {
+export function Dashboard({ report }: { report: TickReport }) {
   const net = report.import_kw - report.export_kw;
   return (
     <div className="dashboard">
@@ -26,14 +20,12 @@ export function Dashboard({
         value={fmtEur(report.budget_eur)}
         warn={report.budget_eur < 0}
       />
+      <Stat label="Population" value={`👤 ${report.population}`} />
+      <Stat label="Foyers" value={`${report.buildings.length}`} />
       <Stat label="CO₂ cumulé" value={`${report.co2_kg_total.toFixed(1)} kg`} />
       <Gauge label="Batterie (SoC)" pct={report.soc_pct} />
-      <Gauge
-        label="Confort moyen"
-        pct={report.avg_comfort_pct}
-        invertColor
-      />
-      <Stat label="Charge" value={`${report.load_kw.toFixed(2)} kW`} />
+      <Gauge label="Confort du village" pct={report.avg_comfort_pct} />
+      <Stat label="Demande" value={`${report.load_kw.toFixed(2)} kW`} />
       <Stat
         label={net >= 0 ? "Import réseau" : "Export réseau"}
         value={`${Math.abs(net).toFixed(2)} kW`}
@@ -41,13 +33,7 @@ export function Dashboard({
       {report.blackout ? (
         <div className="stat blackout-alert">⚠️ BLACK-OUT</div>
       ) : (
-        <div className="stat ok-badge">✓ Alimentée</div>
-      )}
-      {residents.length > 0 && (
-        <Stat
-          label="Habitants"
-          value={`${residents.length}`}
-        />
+        <div className="stat ok-badge">✓ Alimenté</div>
       )}
     </div>
   );

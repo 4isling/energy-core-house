@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "wasm": "wasm-pack build .. --target web --features wasm --out-dir web/src/pkg",
+    "wasm:manual": "cargo build --manifest-path ../Cargo.toml --target wasm32-unknown-unknown --release --features wasm && wasm-bindgen ../target/wasm32-unknown-unknown/release/energy_core.wasm --out-dir src/pkg --target web",
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview"

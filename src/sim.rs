@@ -4,20 +4,23 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::appliance::{Appliance, ApplianceKind};
+use crate::appliance::ApplianceKind;
+use crate::building::{Building, BuildingKind, BuildingReport};
 use crate::economy::{
-    self, capex_battery_per_kwh, capex_hydro, capex_solar, capex_thermal, capex_wind,
-    opex_hydro_year, opex_solar_year, opex_thermal_year, opex_wind_year, Economy,
+    self, capex_battery_per_kwh, capex_building, capex_hydro, capex_solar, capex_thermal,
+    capex_wind, opex_hydro_year, opex_solar_year, opex_thermal_year, opex_wind_year, Economy,
 };
 use crate::physics::{HydroTurbine, SolarArray, ThermalPlant, WindTurbine};
-use crate::resident::{Resident, ResidentProfile};
+use crate::resident::ResidentProfile;
 use crate::storage::Battery;
 use crate::weather::Weather;
 
 const HOURS_PER_YEAR: f64 = 8760.0;
 const EPS: f64 = 1e-6;
 
-/// L'ensemble des actifs construits par le joueur.
+/// Le **micro-réseau partagé** du village : les actifs de production et de
+/// stockage construits par le joueur, mutualisés entre tous les bâtiments.
+/// La demande, elle, vit dans les `Building` (`building.rs`).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Park {
     pub wind: Vec<WindTurbine>,
@@ -25,15 +28,6 @@ pub struct Park {
     pub hydro: Vec<HydroTurbine>,
     pub thermal: Vec<ThermalPlant>,
     pub battery: Option<Battery>,
-    /// Appareils consommateurs de la maison.
-    pub appliances: Vec<Appliance>,
-    /// Habitants (NPC) qui pilotent les appareils au fil de la journée.
-    pub residents: Vec<Resident>,
-    /// Charge additionnelle imposée manuellement (kW) — override/tests.
-    /// La charge totale = somme des appareils allumés + `load_kw`.
-    pub load_kw: f64,
-    /// Compteur d'identifiants d'appareils.
-    next_appliance_id: u32,
 }
 
 impl Park {
@@ -44,44 +38,6 @@ impl Park {
         for h in &self.hydro { o += opex_hydro_year(h); }
         for t in &self.thermal { o += opex_thermal_year(t); }
         o
-    }
-
-    /// Charge appelée par les appareils allumés (kW).
-    pub fn appliance_load_kw(&self) -> f64 {
-        self.appliances.iter().map(|a| a.draw_kw()).sum()
-    }
-
-    /// Ajoute un appareil d'une catégorie donnée, renvoie son id.
-    pub fn add_appliance(&mut self, kind: ApplianceKind) -> u32 {
-        let id = self.next_appliance_id;
-        self.next_appliance_id += 1;
-        self.appliances.push(Appliance::from_kind(id, kind));
-        id
-    }
-
-    /// Bascule l'état on/off d'un appareil. Renvoie false si l'id est inconnu.
-    pub fn toggle_appliance(&mut self, id: u32) -> bool {
-        if let Some(a) = self.appliances.iter_mut().find(|a| a.id == id) {
-            a.on = !a.on;
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Applique la routine des habitants : un appareil est allumé si au moins
-    /// un résident le souhaite à cette heure, ou s'il tourne en continu (frigo).
-    pub fn apply_resident_schedule(&mut self, hour: f64, day: u32) {
-        if self.residents.is_empty() {
-            return;
-        }
-        let mut wanted: Vec<ApplianceKind> = Vec::new();
-        for r in &self.residents {
-            wanted.extend(r.desired_appliances(hour, day));
-        }
-        for a in &mut self.appliances {
-            a.on = a.kind == ApplianceKind::Fridge || wanted.contains(&a.kind);
-        }
     }
 }
 
@@ -106,21 +62,50 @@ pub struct TickReport {
     pub cash_flow_eur: f64,
     pub budget_eur: f64,
     pub co2_kg_total: f64,
-    /// Confort moyen des habitants (0..100). 100 s'il n'y a pas d'habitant.
+    /// Confort moyen du village (0..100), sur tous les habitants de tous les
+    /// bâtiments. 100 s'il n'y a pas d'habitant.
     pub avg_comfort_pct: f64,
+    /// Population totale du village (somme des habitants des bâtiments).
+    pub population: u32,
+    /// Détail par bâtiment (charge, confort, occupants) pour l'UI.
+    pub buildings: Vec<BuildingReport>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SimState {
     pub park: Park,
+    /// Les bâtiments du village (foyers) : l'unité de demande du micro-réseau.
+    pub buildings: Vec<Building>,
     pub economy: Economy,
     pub hour: f64,
     pub day: u32,
+    /// Charge additionnelle globale (kW) — override manuel/tests, hors bâtiments.
+    pub load_kw: f64,
+    /// Compteur d'identifiants de bâtiments.
+    next_building_id: u32,
+    /// Compteur d'identifiants d'appareils, unique sur tout le village.
+    next_appliance_id: u32,
 }
 
 impl SimState {
     pub fn new(starting_budget_eur: f64) -> Self {
-        Self { park: Park::default(), economy: Economy::new(starting_budget_eur), hour: 8.0, day: 1 }
+        Self {
+            park: Park::default(),
+            buildings: Vec::new(),
+            economy: Economy::new(starting_budget_eur),
+            hour: 8.0,
+            day: 1,
+            load_kw: 0.0,
+            next_building_id: 0,
+            next_appliance_id: 0,
+        }
+    }
+
+    /// Peuple un village de départ (quelques foyers déjà habités) pour que la
+    /// boucle de jeu ait du sens dès le lancement. Ne touche pas au budget.
+    pub fn seed_starter_village(&mut self) {
+        self.add_building(BuildingKind::Family);
+        self.add_building(BuildingKind::Elders);
     }
 
     // --- Construction (renvoie false si budget insuffisant) ---
@@ -170,37 +155,93 @@ impl SimState {
     }
 
     pub fn set_load_kw(&mut self, kw: f64) {
-        self.park.load_kw = kw.max(0.0);
+        self.load_kw = kw.max(0.0);
     }
 
-    // --- Appareils & habitants ---
+    // --- Bâtiments du village ---
 
-    pub fn add_appliance(&mut self, kind: ApplianceKind) -> u32 {
-        self.park.add_appliance(kind)
+    /// Construit un bâtiment (débite le CAPEX). Renvoie son id, ou `None` si le
+    /// budget est insuffisant.
+    pub fn build_building(&mut self, kind: BuildingKind) -> Option<u32> {
+        let c = capex_building(kind);
+        if self.economy.budget_eur < c {
+            return None;
+        }
+        self.economy.budget_eur -= c;
+        Some(self.add_building(kind))
     }
+
+    /// Ajoute un bâtiment avec son loadout par défaut, sans toucher au budget
+    /// (utilisé pour l'état initial). Renvoie son id.
+    pub fn add_building(&mut self, kind: BuildingKind) -> u32 {
+        let id = self.next_building_id;
+        self.next_building_id += 1;
+        let b = Building::from_kind(id, kind, self.next_appliance_id);
+        self.next_appliance_id += b.appliances.len() as u32;
+        self.buildings.push(b);
+        id
+    }
+
+    fn building_mut(&mut self, building_id: u32) -> Option<&mut Building> {
+        self.buildings.iter_mut().find(|b| b.id == building_id)
+    }
+
+    // --- Appareils & habitants (scopés par bâtiment) ---
+
+    /// Ajoute un appareil à un bâtiment. Renvoie l'id d'appareil (unique dans le
+    /// village), ou `None` si le bâtiment est inconnu.
+    pub fn add_appliance_to(&mut self, building_id: u32, kind: ApplianceKind) -> Option<u32> {
+        let id = self.next_appliance_id;
+        match self.building_mut(building_id) {
+            Some(b) => {
+                b.add_appliance(id, kind);
+                self.next_appliance_id += 1;
+                Some(id)
+            }
+            None => None,
+        }
+    }
+
+    /// Bascule un appareil par son id, où qu'il soit dans le village.
     pub fn toggle_appliance(&mut self, id: u32) -> bool {
-        self.park.toggle_appliance(id)
+        self.buildings.iter_mut().any(|b| b.toggle_appliance(id))
     }
-    pub fn add_resident(&mut self, name: impl Into<String>, profile: ResidentProfile) {
-        self.park.residents.push(Resident::new(name, profile));
+
+    /// Ajoute un habitant à un bâtiment. Renvoie false si le bâtiment est inconnu.
+    pub fn add_resident_to(
+        &mut self,
+        building_id: u32,
+        name: impl Into<String>,
+        profile: ResidentProfile,
+    ) -> bool {
+        match self.building_mut(building_id) {
+            Some(b) => {
+                b.add_resident(name, profile);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Avance la simulation de `dt_h` heures sous une météo donnée.
     pub fn tick(&mut self, weather: &Weather, dt_h: f64) -> TickReport {
         let budget_before = self.economy.budget_eur;
 
-        // 0. Les habitants pilotent les appareils selon l'heure courante.
-        self.park.apply_resident_schedule(self.hour, self.day);
+        // 0. Dans chaque bâtiment, les habitants pilotent les appareils selon
+        //    l'heure courante, puis on agrège la demande du village.
+        let mut load_kw = self.load_kw;
+        for b in &mut self.buildings {
+            b.apply_resident_schedule(self.hour, self.day);
+            load_kw += b.load_kw();
+        }
 
-        // 1. Production renouvelable instantanée (kW).
+        // 1. Production renouvelable instantanée (kW), mutualisée sur le réseau.
         let wind_kw: f64 = self.park.wind.iter().map(|t| t.power_kw(weather.wind_ms)).sum();
         let solar_kw: f64 = self.park.solar.iter()
             .map(|s| s.power_kw(weather.irradiance_kw_m2, weather.air_temp_c)).sum();
         let hydro_kw: f64 = self.park.hydro.iter().map(|h| h.power_kw(weather.river_flow_m3s)).sum();
         let renewable_kw = wind_kw + solar_kw + hydro_kw;
 
-        // Charge = appareils allumés + override manuel.
-        let load_kw = self.park.appliance_load_kw() + self.park.load_kw;
         let net_kwh = (renewable_kw - load_kw) * dt_h;
 
         let mut thermal_kwh = 0.0;
@@ -259,18 +300,34 @@ impl SimState {
         let opex_step = self.park.opex_year() * dt_h / HOURS_PER_YEAR;
         self.economy.budget_eur -= opex_step;
 
-        // 3. Confort des habitants (un black-out pendant qu'ils sont éveillés
-        //    fait baisser le confort). Évalué à l'heure du pas écoulé.
+        // 3. Confort des habitants du village (un black-out pendant qu'ils sont
+        //    éveillés fait baisser le confort). v1 : black-out à l'échelle du
+        //    village, donc tous les bâtiments sont touchés. Évalué à l'heure du
+        //    pas écoulé. On en profite pour bâtir le détail par bâtiment.
         let blackout = unmet_kwh > EPS;
         let hour_of_step = self.hour;
-        for r in &mut self.park.residents {
-            r.update_comfort(hour_of_step, blackout, dt_h);
+        let mut comfort_sum = 0.0;
+        let mut population = 0u32;
+        let mut building_reports = Vec::with_capacity(self.buildings.len());
+        for b in &mut self.buildings {
+            for r in &mut b.residents {
+                r.update_comfort(hour_of_step, blackout, dt_h);
+            }
+            comfort_sum += b.residents.iter().map(|r| r.comfort).sum::<f64>();
+            population += b.residents.len() as u32;
+            building_reports.push(BuildingReport {
+                id: b.id,
+                name: b.name.clone(),
+                kind: b.kind.label().to_string(),
+                load_kw: b.load_kw(),
+                avg_comfort_pct: b.avg_comfort_pct(),
+                resident_count: b.residents.len() as u32,
+            });
         }
-        let avg_comfort_pct = if self.park.residents.is_empty() {
+        let avg_comfort_pct = if population == 0 {
             100.0
         } else {
-            self.park.residents.iter().map(|r| r.comfort).sum::<f64>()
-                / self.park.residents.len() as f64
+            comfort_sum / population as f64
         };
 
         // 4. Avance l'horloge.
@@ -300,6 +357,8 @@ impl SimState {
             budget_eur: self.economy.budget_eur,
             co2_kg_total: self.economy.co2_kg,
             avg_comfort_pct,
+            population,
+            buildings: building_reports,
         }
     }
 }
@@ -351,22 +410,21 @@ mod tests {
     fn appliance_increases_load() {
         use crate::appliance::ApplianceKind;
         let mut s = SimState::new(50_000.0);
+        let b = s.add_building(BuildingKind::Studio);
+        // Vide les habitants pour isoler l'effet de l'appareil ajouté.
+        s.building_mut(b).unwrap().residents.clear();
         let base = s.tick(&weather(0.0, 0.0), 1.0).load_kw;
-        let id = s.add_appliance(ApplianceKind::Oven);
-        s.park.toggle_appliance(id); // allume le four (éteint par défaut)
+        let id = s.add_appliance_to(b, ApplianceKind::Oven).unwrap();
+        s.toggle_appliance(id); // allume le four (éteint par défaut)
         let with = s.tick(&weather(0.0, 0.0), 1.0).load_kw;
         assert!(with > base, "le four allumé augmente la charge ({with} > {base})");
     }
 
     #[test]
     fn resident_drives_appliances_deterministically() {
-        use crate::appliance::ApplianceKind;
-        use crate::resident::ResidentProfile;
         let build = || {
             let mut s = SimState::new(50_000.0);
-            s.add_appliance(ApplianceKind::Oven);
-            s.add_appliance(ApplianceKind::EvCharger);
-            s.add_resident("Alex", ResidentProfile::Worker);
+            s.add_building(BuildingKind::Family);
             s
         };
         let mut a = build();
@@ -384,16 +442,50 @@ mod tests {
     }
 
     #[test]
-    fn blackout_lowers_comfort() {
-        use crate::resident::ResidentProfile;
+    fn village_load_is_sum_of_buildings() {
+        // Un village de deux foyers consomme plus qu'un seul, même scénario.
+        let mut one = SimState::new(50_000.0);
+        one.add_building(BuildingKind::Family);
+        let mut two = SimState::new(50_000.0);
+        two.add_building(BuildingKind::Family);
+        two.add_building(BuildingKind::Family);
+        // Heure du soir : les foyers consomment.
+        one.hour = 19.0;
+        two.hour = 19.0;
+        let l1 = one.tick(&weather(0.0, 0.0), 0.5).load_kw;
+        let l2 = two.tick(&weather(0.0, 0.0), 0.5).load_kw;
+        assert!(l2 > l1, "deux foyers ({l2}) consomment plus qu'un ({l1})");
+    }
+
+    #[test]
+    fn building_grows_population_and_demand() {
+        let mut s = SimState::new(1_000_000.0);
+        let r0 = s.tick(&weather(0.0, 0.0), 0.5);
+        assert_eq!(r0.population, 0);
+        s.hour = 19.0;
+        let before = s.tick(&weather(0.0, 0.0), 0.5).load_kw;
+        s.build_building(BuildingKind::Family).expect("budget suffisant");
+        let after = s.tick(&weather(0.0, 0.0), 0.5);
+        assert!(after.population >= 2, "le foyer apporte des habitants");
+        assert!(after.load_kw > before, "le nouveau bâtiment augmente la demande");
+        assert_eq!(after.buildings.len(), 1, "le détail par bâtiment est présent");
+    }
+
+    #[test]
+    fn blackout_lowers_comfort_across_village() {
         let mut s = SimState::new(50_000.0);
         s.economy.grid.connected = false;
-        s.add_resident("Alex", ResidentProfile::Retiree);
-        s.set_load_kw(3.0); // aucune prod -> black-out
-        s.hour = 12.0; // habitant éveillé
+        // Deux foyers différents, aucune production -> black-out village.
+        s.add_building(BuildingKind::Family);
+        s.add_building(BuildingKind::Elders);
+        s.hour = 12.0; // habitants éveillés
         let r = s.tick(&weather(0.0, 0.0), 1.0);
         assert!(r.blackout);
         assert!(r.avg_comfort_pct < 100.0, "confort doit chuter, obtenu {}", r.avg_comfort_pct);
+        // Tous les bâtiments habités voient leur confort baisser.
+        for b in &r.buildings {
+            assert!(b.avg_comfort_pct < 100.0, "{} touché par le black-out", b.name);
+        }
     }
 
     #[test]

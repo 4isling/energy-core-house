@@ -1,3 +1,13 @@
+// Détail par bâtiment dans une frame — reflète `BuildingReport` (src/building.rs).
+export interface BuildingReport {
+  id: number;
+  name: string;
+  kind: string;
+  load_kw: number;
+  avg_comfort_pct: number;
+  resident_count: number;
+}
+
 // Reflète `TickReport` (src/sim.rs) renvoyé par `Game.tick()`.
 export interface TickReport {
   hour: number;
@@ -18,6 +28,8 @@ export interface TickReport {
   budget_eur: number;
   co2_kg_total: number;
   avg_comfort_pct: number;
+  population: number;
+  buildings: BuildingReport[];
 }
 
 // Reflète `Appliance` (src/appliance.rs).
@@ -36,7 +48,18 @@ export interface ResidentView {
   comfort: number;
 }
 
-// Codes acceptés par `Game.add_appliance` (cf. parse_appliance_kind, src/wasm.rs).
+// Détail complet d'un bâtiment — reflète `Building` (src/building.rs),
+// renvoyé par `Game.list_buildings()`.
+export interface BuildingView {
+  id: number;
+  kind: string; // "Studio" | "Family" | "Elders" (variante serde)
+  name: string;
+  appliances: ApplianceView[];
+  residents: ResidentView[];
+  load_kw: number;
+}
+
+// Codes acceptés par `Game.add_appliance_to` (cf. parse_appliance_kind, src/wasm.rs).
 export const APPLIANCE_CATALOG: { code: string; label: string; power_kw: number }[] = [
   { code: "fridge", label: "Réfrigérateur", power_kw: 0.15 },
   { code: "lighting", label: "Éclairage", power_kw: 0.3 },
@@ -47,9 +70,23 @@ export const APPLIANCE_CATALOG: { code: string; label: string; power_kw: number 
   { code: "ev_charger", label: "Recharge VE", power_kw: 7.0 },
 ];
 
-// Codes acceptés par `Game.add_resident` (cf. parse_profile, src/wasm.rs).
+// Codes acceptés par `Game.add_resident_to` (cf. parse_profile, src/wasm.rs).
 export const RESIDENT_PROFILES: { code: string; label: string }[] = [
   { code: "worker", label: "Actif" },
   { code: "retiree", label: "Retraité" },
   { code: "teenager", label: "Ado" },
+];
+
+// Codes acceptés par `Game.build_building` (cf. parse_building_kind, src/wasm.rs).
+// Le coût reflète `capex_building` (src/economy.rs).
+export const BUILDING_CATALOG: {
+  code: string;
+  label: string;
+  emoji: string;
+  cost: number;
+  detail: string;
+}[] = [
+  { code: "studio", label: "Studio", emoji: "🏠", cost: 8_000, detail: "1 actif" },
+  { code: "family", label: "Foyer familial", emoji: "🏡", cost: 14_000, detail: "actif + ado" },
+  { code: "elders", label: "Logement séniors", emoji: "🏘️", cost: 11_000, detail: "2 retraités" },
 ];
