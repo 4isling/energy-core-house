@@ -57,6 +57,20 @@ impl WindTurbine {
         }
     }
 
+    /// Micro-éolienne domestique (~5 kW). Petit rotor, mât bas : la loi en v³
+    /// donne naturellement quelques kW. Adaptée à une maison autonome.
+    pub fn micro() -> Self {
+        Self {
+            rated_kw: 5.0,
+            rotor_diameter_m: 5.0,
+            hub_height_m: 18.0,
+            cut_in_ms: 3.0,
+            rated_ms: 11.0,
+            cut_out_ms: 25.0,
+            cp: 0.35,
+        }
+    }
+
     /// Surface balayée par le rotor (m²).
     pub fn swept_area_m2(&self) -> f64 {
         std::f64::consts::PI * (self.rotor_diameter_m / 2.0).powi(2)
@@ -202,6 +216,12 @@ impl ThermalPlant {
         Self { kind, rated_kw }
     }
 
+    /// Groupe électrogène domestique (~6 kW, fioul/essence). Secours pilotable
+    /// pour une maison autonome : polluant et coûteux en combustible.
+    pub fn genset() -> Self {
+        Self::new(FuelKind::Oil, 6.0)
+    }
+
     /// Émissions cycle de vie (gCO2eq/kWh), méthodologie RTE Bilan électrique.
     pub fn co2_g_per_kwh(&self) -> f64 {
         match self.kind {
@@ -263,6 +283,22 @@ mod tests {
         let p = t.power_kw(8.0);
         let unbounded = 0.5 * AIR_DENSITY * t.swept_area_m2() * 8f64.powi(3) * BETZ_LIMIT / 1000.0;
         assert!(p <= unbounded + 1e-6);
+    }
+
+    #[test]
+    fn micro_wind_produces_few_kw() {
+        let t = WindTurbine::micro();
+        let p = t.power_kw(11.0); // au régime nominal
+        assert!((p - 5.0).abs() < 1e-9, "micro-éolien plafonne à 5 kW, obtenu {p}");
+        assert!(t.power_kw(8.0) > 0.0 && t.power_kw(8.0) < 5.0);
+    }
+
+    #[test]
+    fn genset_is_domestic_scale() {
+        let g = ThermalPlant::genset();
+        assert_eq!(g.kind, FuelKind::Oil);
+        assert!((g.rated_kw - 6.0).abs() < 1e-9);
+        assert!(g.co2_g_per_kwh() > 0.0);
     }
 
     #[test]

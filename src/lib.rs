@@ -19,8 +19,10 @@
 //! assert!(report.wind_kw > 0.0);
 //! ```
 
+pub mod appliance;
 pub mod economy;
 pub mod physics;
+pub mod resident;
 pub mod sim;
 pub mod storage;
 pub mod weather;
@@ -28,11 +30,13 @@ pub mod weather;
 #[cfg(feature = "wasm")]
 pub mod wasm;
 
+pub use appliance::{Appliance, ApplianceKind};
 pub use economy::{Economy, Grid};
 pub use physics::{
     wind_at_height, FuelKind, HydroKind, HydroTurbine, SolarArray, ThermalPlant, WindTurbine,
     AIR_DENSITY, BETZ_LIMIT, GRAVITY, WATER_DENSITY,
 };
+pub use resident::{Resident, ResidentProfile};
 pub use sim::{Park, SimState, TickReport};
 pub use storage::Battery;
 pub use weather::{ProceduralWeather, Weather};

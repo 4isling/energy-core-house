@@ -24,8 +24,29 @@ src/
 ├── storage.rs    Battery : rendement round-trip, limites de puissance
 ├── weather.rs    Weather (grandeurs physiques) + ProceduralWeather (RNG seedé)
 ├── economy.rs    CAPEX/OPEX, émissions, réseau (import/export prix spot)
+├── appliance.rs  Appliance : appareils consommateurs (frigo, four, VE…)
+├── resident.rs   Resident : habitants (NPC) + routines journalières
 ├── sim.rs        Park + SimState + tick() : dispatch merit-order
 └── wasm.rs       Façade wasm-bindgen (feature "wasm")
+```
+
+### Jeu « maison autonome »
+
+Le même cœur sert un jeu de gestion de **maison autonome** : presets à l'échelle
+maison (`WindTurbine::micro()` ~5 kW, `ThermalPlant::genset()` ~6 kW, solaire kWc,
+batterie kWh), des **appareils** (`appliance.rs`) que le joueur ajoute, et des
+**habitants** (`resident.rs`) dont les routines déterministes allument/éteignent
+ces appareils — c'est ce qui fait vivre la courbe de consommation. La charge d'un
+pas = somme des appareils allumés. Un black-out pendant qu'un habitant est éveillé
+fait baisser son confort (`TickReport.avg_comfort_pct`).
+
+Un front web React + WASM vit dans `web/` (dashboard + graphes + schéma SVG
+animé) :
+```bash
+cargo install wasm-pack          # une fois
+cd web && npm install
+npm run wasm                     # compile le cœur en WASM dans web/src/pkg
+npm run dev                      # http://localhost:5173
 ```
 
 **Dispatch (ordre de mérite)** à chaque pas de temps :
