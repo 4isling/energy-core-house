@@ -4,11 +4,13 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::appliance::{Appliance, ApplianceKind};
 use crate::economy::{
     self, capex_battery_per_kwh, capex_hydro, capex_solar, capex_thermal, capex_wind,
     opex_hydro_year, opex_solar_year, opex_thermal_year, opex_wind_year, Economy,
 };
 use crate::physics::{HydroTurbine, SolarArray, ThermalPlant, WindTurbine};
+use crate::resident::{Resident, ResidentProfile};
 use crate::storage::Battery;
 use crate::weather::Weather;
 
@@ -23,8 +25,15 @@ pub struct Park {
     pub hydro: Vec<HydroTurbine>,
     pub thermal: Vec<ThermalPlant>,
     pub battery: Option<Battery>,
-    /// Demande instantanée à couvrir (kW). À piloter depuis un profil de charge.
+    /// Appareils consommateurs de la maison.
+    pub appliances: Vec<Appliance>,
+    /// Habitants (NPC) qui pilotent les appareils au fil de la journée.
+    pub residents: Vec<Resident>,
+    /// Charge additionnelle imposée manuellement (kW) — override/tests.
+    /// La charge totale = somme des appareils allumés + `load_kw`.
     pub load_kw: f64,
+    /// Compteur d'identifiants d'appareils.
+    next_appliance_id: u32,
 }
 
 impl Park {
@@ -35,6 +44,44 @@ impl Park {
         for h in &self.hydro { o += opex_hydro_year(h); }
         for t in &self.thermal { o += opex_thermal_year(t); }
         o
+    }
+
+    /// Charge appelée par les appareils allumés (kW).
+    pub fn appliance_load_kw(&self) -> f64 {
+        self.appliances.iter().map(|a| a.draw_kw()).sum()
+    }
+
+    /// Ajoute un appareil d'une catégorie donnée, renvoie son id.
+    pub fn add_appliance(&mut self, kind: ApplianceKind) -> u32 {
+        let id = self.next_appliance_id;
+        self.next_appliance_id += 1;
+        self.appliances.push(Appliance::from_kind(id, kind));
+        id
+    }
+
+    /// Bascule l'état on/off d'un appareil. Renvoie false si l'id est inconnu.
+    pub fn toggle_appliance(&mut self, id: u32) -> bool {
+        if let Some(a) = self.appliances.iter_mut().find(|a| a.id == id) {
+            a.on = !a.on;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Applique la routine des habitants : un appareil est allumé si au moins
+    /// un résident le souhaite à cette heure, ou s'il tourne en continu (frigo).
+    pub fn apply_resident_schedule(&mut self, hour: f64, day: u32) {
+        if self.residents.is_empty() {
+            return;
+        }
+        let mut wanted: Vec<ApplianceKind> = Vec::new();
+        for r in &self.residents {
+            wanted.extend(r.desired_appliances(hour, day));
+        }
+        for a in &mut self.appliances {
+            a.on = a.kind == ApplianceKind::Fridge || wanted.contains(&a.kind);
+        }
     }
 }
 
@@ -59,6 +106,8 @@ pub struct TickReport {
     pub cash_flow_eur: f64,
     pub budget_eur: f64,
     pub co2_kg_total: f64,
+    /// Confort moyen des habitants (0..100). 100 s'il n'y a pas d'habitant.
+    pub avg_comfort_pct: f64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -124,9 +173,24 @@ impl SimState {
         self.park.load_kw = kw.max(0.0);
     }
 
+    // --- Appareils & habitants ---
+
+    pub fn add_appliance(&mut self, kind: ApplianceKind) -> u32 {
+        self.park.add_appliance(kind)
+    }
+    pub fn toggle_appliance(&mut self, id: u32) -> bool {
+        self.park.toggle_appliance(id)
+    }
+    pub fn add_resident(&mut self, name: impl Into<String>, profile: ResidentProfile) {
+        self.park.residents.push(Resident::new(name, profile));
+    }
+
     /// Avance la simulation de `dt_h` heures sous une météo donnée.
     pub fn tick(&mut self, weather: &Weather, dt_h: f64) -> TickReport {
         let budget_before = self.economy.budget_eur;
+
+        // 0. Les habitants pilotent les appareils selon l'heure courante.
+        self.park.apply_resident_schedule(self.hour, self.day);
 
         // 1. Production renouvelable instantanée (kW).
         let wind_kw: f64 = self.park.wind.iter().map(|t| t.power_kw(weather.wind_ms)).sum();
@@ -135,7 +199,8 @@ impl SimState {
         let hydro_kw: f64 = self.park.hydro.iter().map(|h| h.power_kw(weather.river_flow_m3s)).sum();
         let renewable_kw = wind_kw + solar_kw + hydro_kw;
 
-        let load_kw = self.park.load_kw;
+        // Charge = appareils allumés + override manuel.
+        let load_kw = self.park.appliance_load_kw() + self.park.load_kw;
         let net_kwh = (renewable_kw - load_kw) * dt_h;
 
         let mut thermal_kwh = 0.0;
@@ -194,7 +259,21 @@ impl SimState {
         let opex_step = self.park.opex_year() * dt_h / HOURS_PER_YEAR;
         self.economy.budget_eur -= opex_step;
 
-        // 3. Avance l'horloge.
+        // 3. Confort des habitants (un black-out pendant qu'ils sont éveillés
+        //    fait baisser le confort). Évalué à l'heure du pas écoulé.
+        let blackout = unmet_kwh > EPS;
+        let hour_of_step = self.hour;
+        for r in &mut self.park.residents {
+            r.update_comfort(hour_of_step, blackout, dt_h);
+        }
+        let avg_comfort_pct = if self.park.residents.is_empty() {
+            100.0
+        } else {
+            self.park.residents.iter().map(|r| r.comfort).sum::<f64>()
+                / self.park.residents.len() as f64
+        };
+
+        // 4. Avance l'horloge.
         self.hour += dt_h;
         while self.hour >= 24.0 {
             self.hour -= 24.0;
@@ -214,12 +293,13 @@ impl SimState {
             export_kw: export_kwh * inv_dt,
             load_kw,
             unmet_kw: unmet_kwh * inv_dt,
-            blackout: unmet_kwh > EPS,
+            blackout,
             soc_pct: self.park.battery.as_ref().map(|b| b.soc_pct()).unwrap_or(0.0),
             co2_kg_step: co2_step,
             cash_flow_eur: self.economy.budget_eur - budget_before,
             budget_eur: self.economy.budget_eur,
             co2_kg_total: self.economy.co2_kg,
+            avg_comfort_pct,
         }
     }
 }
@@ -265,6 +345,55 @@ mod tests {
         assert!(r.thermal_kw > 0.0);
         assert!(r.co2_kg_step > 0.0, "le charbon doit émettre du CO2");
         assert!(r.cash_flow_eur < 0.0, "le combustible coûte de l'argent");
+    }
+
+    #[test]
+    fn appliance_increases_load() {
+        use crate::appliance::ApplianceKind;
+        let mut s = SimState::new(50_000.0);
+        let base = s.tick(&weather(0.0, 0.0), 1.0).load_kw;
+        let id = s.add_appliance(ApplianceKind::Oven);
+        s.park.toggle_appliance(id); // allume le four (éteint par défaut)
+        let with = s.tick(&weather(0.0, 0.0), 1.0).load_kw;
+        assert!(with > base, "le four allumé augmente la charge ({with} > {base})");
+    }
+
+    #[test]
+    fn resident_drives_appliances_deterministically() {
+        use crate::appliance::ApplianceKind;
+        use crate::resident::ResidentProfile;
+        let build = || {
+            let mut s = SimState::new(50_000.0);
+            s.add_appliance(ApplianceKind::Oven);
+            s.add_appliance(ApplianceKind::EvCharger);
+            s.add_resident("Alex", ResidentProfile::Worker);
+            s
+        };
+        let mut a = build();
+        let mut b = build();
+        let mut load_a = Vec::new();
+        let mut load_b = Vec::new();
+        for _ in 0..48 {
+            load_a.push(a.tick(&weather(5.0, 0.5), 0.5).load_kw);
+            load_b.push(b.tick(&weather(5.0, 0.5), 0.5).load_kw);
+        }
+        assert_eq!(load_a, load_b, "même scénario -> même courbe de charge");
+        // La charge doit varier sur la journée (l'actif est absent à midi).
+        assert!(load_a.iter().cloned().fold(0.0_f64, f64::max) > 0.0);
+        assert!(load_a.windows(2).any(|w| (w[0] - w[1]).abs() > 1e-9));
+    }
+
+    #[test]
+    fn blackout_lowers_comfort() {
+        use crate::resident::ResidentProfile;
+        let mut s = SimState::new(50_000.0);
+        s.economy.grid.connected = false;
+        s.add_resident("Alex", ResidentProfile::Retiree);
+        s.set_load_kw(3.0); // aucune prod -> black-out
+        s.hour = 12.0; // habitant éveillé
+        let r = s.tick(&weather(0.0, 0.0), 1.0);
+        assert!(r.blackout);
+        assert!(r.avg_comfort_pct < 100.0, "confort doit chuter, obtenu {}", r.avg_comfort_pct);
     }
 
     #[test]

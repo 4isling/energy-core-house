@@ -1,0 +1,100 @@
+import type { ResidentView, TickReport } from "../types";
+
+function fmtHour(hour: number): string {
+  const h = Math.floor(hour);
+  const m = Math.round((hour - h) * 60);
+  return `${String(h).padStart(2, "0")}h${String(m).padStart(2, "0")}`;
+}
+
+function fmtEur(v: number): string {
+  return v.toLocaleString("fr-FR", { maximumFractionDigits: 0 }) + " €";
+}
+
+export function Dashboard({
+  report,
+  residents,
+}: {
+  report: TickReport;
+  residents: ResidentView[];
+}) {
+  const net = report.import_kw - report.export_kw;
+  return (
+    <div className="dashboard">
+      <Stat label="Jour" value={`J${report.day} · ${fmtHour(report.hour)}`} />
+      <Stat
+        label="Budget"
+        value={fmtEur(report.budget_eur)}
+        warn={report.budget_eur < 0}
+      />
+      <Stat label="CO₂ cumulé" value={`${report.co2_kg_total.toFixed(1)} kg`} />
+      <Gauge label="Batterie (SoC)" pct={report.soc_pct} />
+      <Gauge
+        label="Confort moyen"
+        pct={report.avg_comfort_pct}
+        invertColor
+      />
+      <Stat label="Charge" value={`${report.load_kw.toFixed(2)} kW`} />
+      <Stat
+        label={net >= 0 ? "Import réseau" : "Export réseau"}
+        value={`${Math.abs(net).toFixed(2)} kW`}
+      />
+      {report.blackout ? (
+        <div className="stat blackout-alert">⚠️ BLACK-OUT</div>
+      ) : (
+        <div className="stat ok-badge">✓ Alimentée</div>
+      )}
+      {residents.length > 0 && (
+        <Stat
+          label="Habitants"
+          value={`${residents.length}`}
+        />
+      )}
+    </div>
+  );
+}
+
+function Stat({
+  label,
+  value,
+  warn,
+}: {
+  label: string;
+  value: string;
+  warn?: boolean;
+}) {
+  return (
+    <div className={`stat${warn ? " warn" : ""}`}>
+      <span className="stat-label">{label}</span>
+      <span className="stat-value">{value}</span>
+    </div>
+  );
+}
+
+function Gauge({
+  label,
+  pct,
+  invertColor,
+}: {
+  label: string;
+  pct: number;
+  invertColor?: boolean;
+}) {
+  const clamped = Math.max(0, Math.min(100, pct));
+  // Confort : vert quand haut. SoC : vert quand haut aussi.
+  const hue = invertColor ? clamped * 1.2 : clamped * 1.2;
+  return (
+    <div className="stat gauge">
+      <span className="stat-label">{label}</span>
+      <div className="gauge-track">
+        <div
+          className="gauge-fill"
+          style={{
+            width: `${clamped}%`,
+            background: `hsl(${hue}, 70%, 45%)`,
+          }}
+        />
+      </div>
+      <span className="stat-value">{clamped.toFixed(0)} %</span>
+    </div>
+  );
+}
