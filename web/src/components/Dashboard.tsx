@@ -20,6 +20,7 @@ export function Dashboard({ report }: { report: TickReport }) {
         value={fmtEur(report.budget_eur)}
         warn={report.budget_eur < 0}
       />
+      <Stat label="Revenu" value={`+${fmtEur(report.revenue_eur_day)}/j`} />
       <Stat label="Population" value={`👤 ${report.population}`} />
       <Stat label="Foyers" value={`${report.buildings.length}`} />
       <Stat label="CO₂ cumulé" value={`${report.co2_kg_total.toFixed(1)} kg`} />

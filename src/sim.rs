@@ -126,6 +126,9 @@ pub struct TickReport {
     pub avg_comfort_pct: f64,
     /// Population totale du village (somme des habitants des bâtiments).
     pub population: u32,
+    /// Revenu instantané du village (€/jour) : salaires/pensions des habitants,
+    /// pondérés par leur confort. Crédité au budget à chaque pas de temps.
+    pub revenue_eur_day: f64,
     /// Détail par bâtiment (charge, confort, occupants) pour l'UI.
     pub buildings: Vec<BuildingReport>,
 }
@@ -576,10 +579,13 @@ impl SimState {
         let hour_of_step = self.hour;
         let mut comfort_sum = 0.0;
         let mut population = 0u32;
+        // Revenu instantané (€/jour) : salaires/pensions pondérés par le confort.
+        let mut revenue_eur_day = 0.0;
         let mut building_reports = Vec::with_capacity(self.buildings.len());
         for b in &mut self.buildings {
             for r in &mut b.residents {
                 r.update_comfort(hour_of_step, blackout, dt_h);
+                revenue_eur_day += r.profile.income_eur_per_day() * (r.comfort / 100.0);
             }
             comfort_sum += b.residents.iter().map(|r| r.comfort).sum::<f64>();
             population += b.residents.len() as u32;
@@ -599,6 +605,9 @@ impl SimState {
         } else {
             comfort_sum / population as f64
         };
+
+        // 3b. Revenu du pas : crédite le budget (principale rentrée d'argent).
+        self.economy.budget_eur += revenue_eur_day * (dt_h / 24.0);
 
         // 4. Avance l'horloge.
         self.hour += dt_h;
@@ -628,6 +637,7 @@ impl SimState {
             co2_kg_total: self.economy.co2_kg,
             avg_comfort_pct,
             population,
+            revenue_eur_day,
             buildings: building_reports,
         }
     }
@@ -845,6 +855,41 @@ mod tests {
         let p_low = s.park.wind[0].asset.power_kw(w.wind_ms * s.park.wind[0].env.wind_factor);
         let p_hi = s.park.wind[1].asset.power_kw(w.wind_ms * s.park.wind[1].env.wind_factor);
         assert!(p_hi >= p_low, "tuile plus ventée -> au moins autant de prod");
+    }
+
+    #[test]
+    fn working_residents_generate_revenue() {
+        // Un village bien alimenté gagne de l'argent (salaires/pensions).
+        let mut s = SimState::new(50_000.0);
+        s.add_building(BuildingKind::Family); // un actif -> revenu
+        s.build_battery(50.0); // de quoi éviter tout black-out
+        s.build_wind(WindTurbine::onshore_2mw());
+        let r = s.tick(&weather(13.0, 0.0), 0.5);
+        assert!(r.revenue_eur_day > 0.0, "des habitants actifs rapportent un revenu");
+        assert!(!r.blackout);
+        assert!(r.cash_flow_eur > 0.0, "village alimenté -> trésorerie positive");
+    }
+
+    #[test]
+    fn blackout_cuts_revenue() {
+        // À confort égalisé, un black-out prolongé réduit le revenu (confort bas).
+        let mut happy = SimState::new(50_000.0);
+        happy.add_building(BuildingKind::Family);
+        let mut sad = SimState::new(50_000.0);
+        sad.economy.grid.connected = false;
+        sad.add_building(BuildingKind::Family);
+        sad.hour = 12.0;
+        happy.hour = 12.0;
+        // Plusieurs pas de black-out font chuter le confort -> le revenu baisse.
+        let mut last_sad = 0.0;
+        let mut last_happy = 0.0;
+        for _ in 0..20 {
+            last_happy = happy.tick(&weather(0.0, 0.0), 1.0).revenue_eur_day;
+            last_sad = sad.tick(&weather(0.0, 0.0), 1.0).revenue_eur_day;
+        }
+        // Le village "happy" n'a pas de prod non plus ici, mais ses habitants ne
+        // subissent pas de black-out tant qu'il reste raccordé au réseau.
+        assert!(last_happy > last_sad, "le black-out réduit le revenu ({last_happy} > {last_sad})");
     }
 
     #[test]

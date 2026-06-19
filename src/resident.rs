@@ -27,6 +27,19 @@ impl ResidentProfile {
             ResidentProfile::Teenager => "Ado",
         }
     }
+
+    /// Revenu brut apporté par cet habitant (€/jour) : salaire pour un actif,
+    /// pension pour un retraité, rien pour un ado. C'est la principale source de
+    /// rentrées d'argent du village (cf. `SimState::tick`). Le revenu effectif
+    /// est ensuite pondéré par le **confort** de l'habitant : un colon mal
+    /// alimenté travaille/dépense moins.
+    pub fn income_eur_per_day(self) -> f64 {
+        match self {
+            ResidentProfile::Worker => 90.0,
+            ResidentProfile::Retiree => 40.0,
+            ResidentProfile::Teenager => 0.0,
+        }
+    }
 }
 
 /// Un habitant de la maison.
