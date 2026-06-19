@@ -80,6 +80,7 @@ export function App() {
             <MapView
               terrain={game.terrain}
               placements={game.placements}
+              lines={game.lines}
               selectedTool={tool}
               onPlace={onPlace}
               onHoverTile={onHoverTile}
