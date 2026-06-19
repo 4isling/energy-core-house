@@ -8,6 +8,7 @@ use wasm_bindgen::prelude::*;
 
 use crate::appliance::ApplianceKind;
 use crate::building::BuildingKind;
+use crate::grid::{Grid, NodeReport, Tier};
 use crate::physics::{FuelKind, HydroKind, HydroTurbine, SolarArray, ThermalPlant, WindTurbine};
 use crate::resident::ResidentProfile;
 use crate::sim::{BuildError, SimState, TickReport};
@@ -350,5 +351,178 @@ impl Game {
     }
     pub fn co2_kg(&self) -> f64 {
         self.sim.economy.co2_kg
+    }
+}
+
+// ===========================================================================
+// Façade WASM du réseau multi-couches (national / quartier / maison).
+// Indépendante de `Game` (mono-carte), qui reste inchangé.
+// ===========================================================================
+
+/// Amplitude du **foisonnement** : écart météo relatif décorrélé par nœud.
+const FOISONNEMENT_AMPLITUDE: f64 = 0.25;
+
+/// Vue d'un nœud du réseau pour le front (arbre + inspecteur). Synthétise le
+/// `GridNode` (dont le `Park` complet n'a pas besoin de remonter au JS).
+#[derive(Serialize)]
+struct GridNodeView {
+    id: u32,
+    tier: &'static str,
+    name: String,
+    parent: Option<u32>,
+    children: Vec<u32>,
+    load_kw: f64,
+    autonomy_pref: f64,
+    income_eur_per_day: f64,
+    balance_eur: f64,
+    fixed_cost_eur_per_day: f64,
+    islanded: bool,
+    /// Composition de l'auto-production (pour l'inspecteur de maison/quartier).
+    solar_kwc: f64,
+    battery_kwh: f64,
+    wind_count: u32,
+    thermal_count: u32,
+    /// Tarif de la connexion au parent (None pour la racine).
+    import_price_eur_kwh: f64,
+    export_price_eur_kwh: f64,
+    link_capacity_kw: f64,
+    has_uplink: bool,
+}
+
+fn tier_label(t: Tier) -> &'static str {
+    t.label()
+}
+
+/// Construit la vue front d'un nœud du réseau.
+fn node_view(n: &crate::grid::GridNode) -> GridNodeView {
+    let (import_price, export_price, cap, has_uplink) = match &n.uplink {
+        Some(l) => (l.import_price_eur_kwh, l.export_price_eur_kwh, l.capacity_kw, true),
+        None => (0.0, 0.0, 0.0, false),
+    };
+    GridNodeView {
+        id: n.id,
+        tier: tier_label(n.tier),
+        name: n.name.clone(),
+        parent: n.parent,
+        children: n.children.clone(),
+        load_kw: n.load_kw,
+        autonomy_pref: n.autonomy_pref,
+        income_eur_per_day: n.income_eur_per_day,
+        balance_eur: n.wallet.balance_eur,
+        fixed_cost_eur_per_day: n.wallet.fixed_cost_eur_per_day,
+        islanded: n.islanded(),
+        solar_kwc: n.park.solar.iter().map(|p| p.asset.kwc).sum(),
+        battery_kwh: n.park.battery.as_ref().map(|b| b.capacity_kwh).unwrap_or(0.0),
+        wind_count: n.park.wind.len() as u32,
+        thermal_count: n.park.thermal.len() as u32,
+        import_price_eur_kwh: import_price,
+        export_price_eur_kwh: export_price,
+        link_capacity_kw: cap,
+        has_uplink,
+    }
+}
+
+#[wasm_bindgen]
+pub struct GridGame {
+    grid: Grid,
+    weather: ProceduralWeather,
+    /// Derniers rapports (un par nœud) du dernier `tick`, pour `summary`/UI.
+    last_reports: Vec<NodeReport>,
+}
+
+#[wasm_bindgen]
+impl GridGame {
+    /// Crée un réseau de départ : 1 national → `n_districts` quartiers →
+    /// `houses_per_district` maisons. Déterministe (seedé).
+    #[wasm_bindgen(constructor)]
+    pub fn new(seed: u32, n_districts: u32, houses_per_district: u32) -> GridGame {
+        let grid = Grid::scenario(seed as u64, n_districts as usize, houses_per_district as usize);
+        GridGame {
+            grid,
+            weather: ProceduralWeather::new(seed as u64),
+            last_reports: Vec::new(),
+        }
+    }
+
+    /// Avance tout l'arbre d'un pas : génère la météo de base, l'éclate par nœud
+    /// (foisonnement), équilibre en deux passes et renvoie la liste des
+    /// `NodeReport` (objets JS natifs).
+    pub fn tick(&mut self, dt_h: f64) -> Result<JsValue, JsValue> {
+        let base = self.weather.sample(self.grid.sim_hours);
+        self.grid.propagate_weather(base, FOISONNEMENT_AMPLITUDE);
+        let reports = self.grid.tick(dt_h);
+        let js = serde_wasm_bindgen::to_value(&reports).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        self.last_reports = reports;
+        Ok(js)
+    }
+
+    /// Indicateurs de spirale (marge nationale, taux de dépendance…) calculés sur
+    /// le dernier pas. Renvoie `null` tant qu'aucun `tick` n'a eu lieu.
+    pub fn summary(&self) -> Result<JsValue, JsValue> {
+        if self.last_reports.is_empty() {
+            return Ok(JsValue::NULL);
+        }
+        let s = self.grid.summary(&self.last_reports);
+        serde_wasm_bindgen::to_value(&s).map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    pub fn root(&self) -> u32 {
+        self.grid.root
+    }
+    pub fn node_count(&self) -> u32 {
+        self.grid.nodes.len() as u32
+    }
+
+    /// Vue synthétique d'un nœud (objet JS) pour l'arbre et l'inspecteur.
+    pub fn node(&self, id: u32) -> Result<JsValue, JsValue> {
+        let n = self
+            .grid
+            .nodes
+            .get(id as usize)
+            .ok_or_else(|| JsValue::from_str("nœud inconnu"))?;
+        serde_wasm_bindgen::to_value(&node_view(n)).map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// Liste des vues de **tous** les nœuds (pour construire l'arbre côté front).
+    pub fn nodes(&self) -> Result<JsValue, JsValue> {
+        let views: Vec<GridNodeView> = self.grid.nodes.iter().map(node_view).collect();
+        serde_wasm_bindgen::to_value(&views).map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// Ids des enfants directs d'un nœud (drill-down).
+    pub fn children(&self, id: u32) -> Vec<u32> {
+        self.grid
+            .nodes
+            .get(id as usize)
+            .map(|n| n.children.clone())
+            .unwrap_or_default()
+    }
+
+    // --- Actions joueur ---
+
+    /// Règle le tarif national (prix import/export des liens des quartiers). C'est
+    /// le levier de la spirale : l'augmenter rend l'autoproduction plus rentable.
+    pub fn set_national_tariff(&mut self, import_price_eur_kwh: f64, export_price_eur_kwh: f64) {
+        self.grid.set_national_tariff(import_price_eur_kwh, export_price_eur_kwh);
+    }
+
+    /// Îlote (ou reconnecte) un nœud : coupe son lien au parent pour tester la
+    /// résilience d'un quartier face à une panne du national.
+    pub fn island_node(&mut self, id: u32, islanded: bool) {
+        self.grid.set_islanded(id, islanded);
+    }
+
+    /// Construit du solaire (kWc) sur un nœud (national/quartier), débité de son
+    /// portefeuille. Renvoie `false` si le solde est insuffisant.
+    pub fn build_solar_on(&mut self, id: u32, kwc: f64) -> bool {
+        self.grid.build_solar(id, kwc)
+    }
+    /// Construit une micro-éolienne sur un nœud (débit du portefeuille du nœud).
+    pub fn build_wind_on(&mut self, id: u32) -> bool {
+        self.grid.build_wind_micro(id)
+    }
+    /// Ajoute de la batterie (kWh) sur un nœud (débit du portefeuille du nœud).
+    pub fn build_battery_on(&mut self, id: u32, capacity_kwh: f64) -> bool {
+        self.grid.build_battery(id, capacity_kwh)
     }
 }

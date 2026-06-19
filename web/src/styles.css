@@ -463,3 +463,271 @@ button:disabled {
 .tool-label {
   font-size: 12px;
 }
+
+/* ===================================================================== */
+/* Réseau multi-couches (mode « Réseau » : GridApp, navigation, panneaux) */
+/* ===================================================================== */
+
+.mode-switch {
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+.mode-switch button {
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 14px;
+  cursor: pointer;
+}
+.mode-switch button.active {
+  color: var(--text);
+  border-color: var(--accent);
+  background: rgba(58, 166, 166, 0.12);
+}
+
+.grid-app {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 16px;
+}
+
+.grid-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.layer-nav {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+}
+.layer-nav .crumb {
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 15px;
+  padding: 4px 6px;
+  border-radius: 6px;
+}
+.layer-nav .crumb:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.05);
+}
+.layer-nav .crumb.active {
+  color: var(--text);
+  font-weight: 600;
+}
+.crumb-sep {
+  color: var(--muted);
+  margin: 0 2px;
+}
+
+.grid-main {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.spiral-panel,
+.node-inspector {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 16px;
+}
+.spiral-panel h3,
+.node-inspector h3 {
+  margin: 0 0 12px;
+}
+
+.spiral-gauge {
+  margin: 14px 0 6px;
+}
+.spiral-gauge .gauge-track {
+  margin-top: 6px;
+}
+.spiral-hint {
+  color: var(--muted);
+  font-size: 14px;
+  margin: 4px 0 14px;
+}
+
+.tariff-control {
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+}
+.tariff-control h4 {
+  margin: 0 0 8px;
+}
+.tariff-control label {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-right: 12px;
+  color: var(--muted);
+  font-size: 13px;
+}
+.tariff-control input {
+  width: 90px;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 7px;
+}
+.tariff-control button,
+.ni-actions button,
+.grid-toolbar > button {
+  background: var(--accent);
+  color: #04201f;
+  border: none;
+  border-radius: 8px;
+  padding: 7px 12px;
+  cursor: pointer;
+  font-weight: 600;
+}
+.tariff-control button {
+  margin-top: 8px;
+}
+
+.ni-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.ni-balance {
+  font-weight: 700;
+  color: var(--accent);
+}
+.ni-assets {
+  color: var(--muted);
+  font-size: 14px;
+}
+.ni-household .muted,
+.muted {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.ni-actions {
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+  margin-top: 8px;
+}
+.ni-actions h4,
+.ni-children h4 {
+  margin: 0 0 8px;
+}
+.action-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.island-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.ni-children {
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+  margin-top: 12px;
+}
+.child-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 10px;
+}
+.child-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  text-align: left;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px;
+  cursor: pointer;
+  color: var(--text);
+}
+.child-card:hover {
+  border-color: var(--accent);
+}
+.cc-name {
+  font-weight: 600;
+}
+.cc-line {
+  color: var(--muted);
+  font-size: 13px;
+}
+.cc-flags {
+  display: flex;
+  gap: 4px;
+}
+
+.badge {
+  font-size: 12px;
+  padding: 1px 4px;
+  border-radius: 5px;
+}
+.badge.islanded {
+  background: rgba(220, 120, 40, 0.18);
+  color: #f0a868;
+}
+
+/* Phase 5 : contrôles de vitesse, flux P2P, graphe par nœud */
+.grid-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.speed-group {
+  display: flex;
+  gap: 2px;
+}
+.speed-group button {
+  background: var(--bg);
+  color: var(--muted);
+  border: 1px solid var(--border);
+  padding: 5px 9px;
+  cursor: pointer;
+}
+.speed-group button:first-child { border-radius: 8px 0 0 8px; }
+.speed-group button:last-child { border-radius: 0 8px 8px 0; }
+.speed-group button.active {
+  color: var(--text);
+  border-color: var(--accent);
+  background: rgba(58, 166, 166, 0.15);
+}
+
+.p2p-panel {
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+  margin-top: 12px;
+}
+.p2p-panel h4 { margin: 0 0 6px; }
+
+.grid-main .chart-card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 16px;
+}
+.grid-main .chart-card h2 {
+  margin: 0 0 8px;
+  font-size: 16px;
+}
