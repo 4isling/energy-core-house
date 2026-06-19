@@ -1,5 +1,7 @@
 # energy-core
 
+> 🎮 **Jouer en ligne** : https://4isling.github.io/energy-core-house/
+
 Moteur de simulation énergétique **déterministe**, **testé** et **portable** pour
 un jeu de gestion. Toute la physique (éolien, solaire, hydro, thermique,
 stockage), le dispatch et l'économie vivent ici — **zéro dépendance au rendu**.
