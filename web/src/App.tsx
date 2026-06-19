@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useGame } from "./useGame";
 import { Dashboard } from "./components/Dashboard";
 import { ProductionChart } from "./components/ProductionChart";
@@ -39,6 +39,15 @@ export function App() {
     (x: number, y: number) => setHover(game.tileInfo(x, y)),
     [game],
   );
+
+  // Notifie les mouvements de population (arrivées / départs automatiques).
+  const report = game.report;
+  useEffect(() => {
+    if (!report) return;
+    if (report.arrivals > 0) setFlash(`👤 +${report.arrivals} colon arrivé !`);
+    else if (report.departures > 0)
+      setFlash(`👋 ${report.departures} colon parti (mécontent)`);
+  }, [report]);
 
   if (!game.ready || !game.report || !game.terrain) {
     return <div className="loading">Chargement du moteur…</div>;

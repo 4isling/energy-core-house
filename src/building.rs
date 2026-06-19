@@ -32,6 +32,18 @@ impl BuildingKind {
         }
     }
 
+    /// Nombre maximal d'habitants que ce type de bâtiment peut accueillir.
+    /// Au-delà du loadout de départ, des colons peuvent **emménager** tant qu'il
+    /// reste de la place (cf. `SimState::population_step`).
+    pub fn capacity(self) -> usize {
+        match self {
+            BuildingKind::Studio => 2,
+            BuildingKind::Family => 5,
+            // Couple de séniors : pas d'accueil de nouveaux arrivants.
+            BuildingKind::Elders => 2,
+        }
+    }
+
     /// Appareils installés par défaut dans ce type de bâtiment.
     pub fn default_appliances(self) -> Vec<ApplianceKind> {
         use ApplianceKind::*;

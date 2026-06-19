@@ -120,12 +120,19 @@ impl Resident {
         v
     }
 
-    /// Met à jour le confort sur un pas de temps `dt_h` selon l'état du réseau.
-    pub fn update_comfort(&mut self, hour: f64, blackout: bool, dt_h: f64) {
+    /// Met à jour le confort sur un pas de temps `dt_h`.
+    /// - un black-out pendant que l'habitant est éveillé fait chuter le confort ;
+    /// - sinon le confort remonte doucement ;
+    /// - `crowd_penalty` (%/h) est un malaise diffus dû à la **surpopulation**
+    ///   du village (appliqué même quand tout est alimenté).
+    pub fn update_comfort(&mut self, hour: f64, blackout: bool, dt_h: f64, crowd_penalty: f64) {
         if blackout && self.awake(hour) {
             self.comfort = (self.comfort - 15.0 * dt_h).max(0.0);
         } else {
             self.comfort = (self.comfort + 2.0 * dt_h).min(100.0);
+        }
+        if crowd_penalty > 0.0 {
+            self.comfort = (self.comfort - crowd_penalty * dt_h).max(0.0);
         }
     }
 }
@@ -150,10 +157,10 @@ mod tests {
     #[test]
     fn comfort_drops_on_blackout_when_awake() {
         let mut r = Resident::new("Alex", ResidentProfile::Worker);
-        r.update_comfort(12.0, true, 1.0); // éveillé + black-out
+        r.update_comfort(12.0, true, 1.0, 0.0); // éveillé + black-out
         assert!(r.comfort < 100.0);
         let before = r.comfort;
-        r.update_comfort(3.0, true, 1.0); // endormi → pas de pénalité
+        r.update_comfort(3.0, true, 1.0, 0.0); // endormi → pas de pénalité
         assert!(r.comfort >= before);
     }
 }
