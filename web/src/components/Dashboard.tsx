@@ -22,6 +22,9 @@ export function Dashboard({ report }: { report: TickReport }) {
       />
       <Stat label="Revenu" value={`+${fmtEur(report.revenue_eur_day)}/j`} />
       <Stat label="Population" value={`👤 ${report.population}`} />
+      {report.waiting > 0 && (
+        <Stat label="En attente" value={`⏳ ${report.waiting}`} />
+      )}
       <Stat label="Foyers" value={`${report.buildings.length}`} />
       <Stat label="CO₂ cumulé" value={`${report.co2_kg_total.toFixed(1)} kg`} />
       <Gauge label="Batterie (SoC)" pct={report.soc_pct} />
@@ -35,6 +38,9 @@ export function Dashboard({ report }: { report: TickReport }) {
         <div className="stat blackout-alert">⚠️ BLACK-OUT</div>
       ) : (
         <div className="stat ok-badge">✓ Alimenté</div>
+      )}
+      {report.overcrowded && (
+        <div className="stat blackout-alert">🏠 SURPOPULATION</div>
       )}
     </div>
   );

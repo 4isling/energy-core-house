@@ -64,6 +64,8 @@ export interface TickReport {
   population: number;
   arrivals: number;
   departures: number;
+  waiting: number;
+  overcrowded: boolean;
   revenue_eur_day: number;
   buildings: BuildingReport[];
 }

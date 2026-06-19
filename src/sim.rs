@@ -19,11 +19,20 @@ use crate::weather::Weather;
 const HOURS_PER_YEAR: f64 = 8760.0;
 const EPS: f64 = 1e-6;
 
-/// Confort moyen du village (%) au-dessus duquel de nouveaux colons emménagent
-/// (au plus un par jour, s'il reste de la place).
-const ARRIVE_COMFORT: f64 = 75.0;
 /// Confort individuel (%) en dessous duquel un habitant **quitte** le village.
 const DEPART_COMFORT: f64 = 15.0;
+/// Plafond de la file d'attente d'immigration (pression accumulée quand la
+/// colonie est attractive mais qu'il n'y a plus de logement libre).
+const PRESSURE_CAP: f64 = 6.0;
+/// Nombre maximal d'emménagements par jour.
+const MAX_ARRIVALS_PER_DAY: u32 = 2;
+/// Taux d'occupation (population / capacité totale) au-delà duquel la
+/// **surpopulation** dégrade le confort.
+const CROWD_THRESHOLD: f64 = 0.85;
+/// Malaise de surpopulation (%/h) appliqué au-dessus de `CROWD_THRESHOLD`.
+/// Légèrement supérieur à la remontée naturelle (+2 %/h) : un village trop plein
+/// se dégrade lentement → il faut agrandir avant que les colons ne partent.
+const CROWD_PENALTY: f64 = 3.0;
 
 /// Facteurs de terrain capturés à la pose d'un actif : ils **modulent** les
 /// entrées de la physique (`physics.rs`) sans changer aucune formule
@@ -136,6 +145,10 @@ pub struct TickReport {
     pub arrivals: u32,
     /// Nombre de colons partis à ce pas (mécontents).
     pub departures: u32,
+    /// File d'attente d'immigration (candidats voulant emménager, faute de place).
+    pub waiting: u32,
+    /// Le village est-il en surpopulation (occupation > seuil) ?
+    pub overcrowded: bool,
     /// Revenu instantané du village (€/jour) : salaires/pensions des habitants,
     /// pondérés par leur confort. Crédité au budget à chaque pas de temps.
     pub revenue_eur_day: f64,
@@ -165,8 +178,10 @@ pub struct SimState {
     next_appliance_id: u32,
     /// Compteur pour nommer les nouveaux arrivants.
     next_newcomer: u32,
-    /// Dernier jour où l'on a évalué l'arrivée d'un colon (1 arrivée max/jour).
+    /// Dernier jour où l'on a évalué l'immigration (cadencée à la journée).
     last_pop_day: u32,
+    /// Pression d'immigration accumulée (file d'attente de candidats).
+    immigration_pressure: f64,
 }
 
 impl SimState {
@@ -184,14 +199,24 @@ impl SimState {
             next_appliance_id: 0,
             next_newcomer: 0,
             last_pop_day: 1,
+            immigration_pressure: 0.0,
         }
     }
 
-    /// Dynamique de population : les colons **mécontents partent** (confort sous
-    /// `DEPART_COMFORT`), et si la colonie est **accueillante** (confort moyen
-    /// au-dessus de `ARRIVE_COMFORT`) un nouvel habitant **emménage** dans le
-    /// premier foyer ayant de la place (au plus un par jour). Déterministe.
-    /// Renvoie `(arrivées, départs)` pour ce pas.
+    /// Capacité d'accueil totale du village (somme des capacités des foyers).
+    pub fn total_capacity(&self) -> usize {
+        self.buildings.iter().map(|b| b.kind.capacity()).sum()
+    }
+
+    /// Dynamique de population (déterministe). Renvoie `(arrivées, départs)`.
+    ///
+    /// - **Départs** : tout colon dont le confort tombe sous `DEPART_COMFORT`
+    ///   s'en va (évalué à chaque pas → réaction rapide au mécontentement).
+    /// - **Pression d'immigration** : une fois par jour, l'attractivité (fonction
+    ///   du confort moyen) **alimente une file d'attente** ; des candidats
+    ///   **emménagent** tant qu'il reste de la place (plafonné par jour). Quand
+    ///   tout est plein, la pression s'accumule (jusqu'à `PRESSURE_CAP`) : c'est
+    ///   le signal qu'il faut construire des logements.
     fn population_step(&mut self, avg_comfort: f64) -> (u32, u32) {
         // Départs immédiats des habitants trop mécontents.
         let mut departures = 0u32;
@@ -200,20 +225,29 @@ impl SimState {
             b.residents.retain(|r| r.comfort >= DEPART_COMFORT);
             departures += (before - b.residents.len()) as u32;
         }
-        // Arrivée : au plus une par jour, si la colonie est accueillante.
+
+        // Immigration cadencée à la journée.
         let mut arrivals = 0u32;
         if self.day != self.last_pop_day {
             self.last_pop_day = self.day;
-            if avg_comfort >= ARRIVE_COMFORT {
-                if let Some(idx) = self
+            // Attractivité 0..1 : nulle sous 50 % de confort, max à 100 %.
+            let attract = ((avg_comfort - 50.0) / 50.0).clamp(0.0, 1.0);
+            self.immigration_pressure = (self.immigration_pressure + attract).min(PRESSURE_CAP);
+            // Emménagements tant qu'il y a de la pression ET de la place.
+            while self.immigration_pressure >= 1.0 && arrivals < MAX_ARRIVALS_PER_DAY {
+                match self
                     .buildings
                     .iter()
                     .position(|b| b.residents.len() < b.kind.capacity())
                 {
-                    self.next_newcomer += 1;
-                    let name = format!("Colon {}", self.next_newcomer);
-                    self.buildings[idx].add_resident(name, ResidentProfile::Worker);
-                    arrivals = 1;
+                    Some(idx) => {
+                        self.next_newcomer += 1;
+                        let name = format!("Colon {}", self.next_newcomer);
+                        self.buildings[idx].add_resident(name, ResidentProfile::Worker);
+                        self.immigration_pressure -= 1.0;
+                        arrivals += 1;
+                    }
+                    None => break, // plus de logement → la file d'attente reste
                 }
             }
         }
@@ -626,6 +660,12 @@ impl SimState {
         //    pas écoulé. On en profite pour bâtir le détail par bâtiment.
         let blackout = unmet_kwh > EPS;
         let hour_of_step = self.hour;
+        // Surpopulation : malaise diffus quand l'occupation dépasse le seuil.
+        let total_cap = self.total_capacity();
+        let pop_now: usize = self.buildings.iter().map(|b| b.residents.len()).sum();
+        let occupancy = if total_cap > 0 { pop_now as f64 / total_cap as f64 } else { 0.0 };
+        let overcrowded = occupancy > CROWD_THRESHOLD;
+        let crowd_penalty = if overcrowded { CROWD_PENALTY } else { 0.0 };
         let mut comfort_sum = 0.0;
         let mut population = 0u32;
         // Revenu instantané (€/jour) : salaires/pensions pondérés par le confort.
@@ -633,7 +673,7 @@ impl SimState {
         let mut building_reports = Vec::with_capacity(self.buildings.len());
         for b in &mut self.buildings {
             for r in &mut b.residents {
-                r.update_comfort(hour_of_step, blackout, dt_h);
+                r.update_comfort(hour_of_step, blackout, dt_h, crowd_penalty);
                 revenue_eur_day += r.profile.income_eur_per_day() * (r.comfort / 100.0);
             }
             comfort_sum += b.residents.iter().map(|r| r.comfort).sum::<f64>();
@@ -665,9 +705,10 @@ impl SimState {
             self.day += 1;
         }
 
-        // 5. Dynamique de population : arrivées (colonie accueillante) et
-        //    départs (colons mécontents).
+        // 5. Dynamique de population : départs (mécontents), pression
+        //    d'immigration et emménagements.
         let (arrivals, departures) = self.population_step(avg_comfort_pct);
+        let waiting = self.immigration_pressure.floor() as u32;
 
         let inv_dt = if dt_h > 0.0 { 1.0 / dt_h } else { 0.0 };
         TickReport {
@@ -692,6 +733,8 @@ impl SimState {
             population,
             arrivals,
             departures,
+            waiting,
+            overcrowded,
             revenue_eur_day,
             buildings: building_reports,
         }
@@ -981,13 +1024,38 @@ mod tests {
     }
 
     #[test]
-    fn full_colony_stops_attracting() {
-        // Si tous les foyers sont pleins, plus d'arrivée même en étant heureux.
+    fn full_colony_builds_waiting_pressure() {
+        // Foyer plein : pas d'arrivée, mais une file d'attente se forme au fil
+        // des jours (pression d'immigration accumulée faute de logement).
         let mut s = SimState::new(50_000.0);
         s.add_building(BuildingKind::Elders); // capacité 2, déjà 2 habitants -> plein
         s.hour = 23.0;
-        let r = s.tick(&weather(0.0, 0.0), 1.5);
-        assert_eq!(r.arrivals, 0, "aucune place -> aucune arrivée");
+        let mut total_arrivals = 0u32;
+        let mut last_waiting = 0u32;
+        for _ in 0..30 {
+            let r = s.tick(&weather(0.0, 0.0), 1.0);
+            total_arrivals += r.arrivals;
+            last_waiting = r.waiting;
+        }
+        assert_eq!(total_arrivals, 0, "aucune place -> aucune arrivée");
+        assert!(last_waiting >= 1, "des candidats s'accumulent en attente, obtenu {last_waiting}");
+    }
+
+    #[test]
+    fn overcrowding_lowers_comfort() {
+        // Village plein (occupation 100 %), bien alimenté : la surpopulation
+        // fait quand même baisser le confort (il faut agrandir).
+        let mut s = SimState::new(50_000.0);
+        s.add_building(BuildingKind::Elders); // 2/2 -> occupation 1.0
+        s.hour = 12.0;
+        let start = s.buildings[0].avg_comfort_pct();
+        let mut last = start;
+        for _ in 0..8 {
+            let r = s.tick(&weather(0.0, 0.0), 1.0);
+            assert!(r.overcrowded, "le village plein est en surpopulation");
+            last = r.avg_comfort_pct;
+        }
+        assert!(last < start, "surpopulation -> confort en baisse ({last} < {start})");
     }
 
     #[test]
