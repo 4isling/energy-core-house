@@ -121,20 +121,43 @@ impl Park {
         o
     }
 
-    /// **Dispatch local** du parc, *pur* (aucune dépendance à l'économie ni au
-    /// réseau) : il produit le renouvelable, applique la batterie mutualisée puis
-    /// les centrales pilotables, et renvoie le **résidu signé** (cf.
-    /// [`ParkDispatch`]). C'est le cœur partagé entre le jeu mono-carte
-    /// (`SimState::tick`) et le réseau multi-couches (`grid.rs`) : un seul et
-    /// même équilibrage local, deux échelles.
+    /// Ajoute un actif solaire **non spatial** (env neutre) au parc. Pratique pour
+    /// les parcs de nœuds du réseau multi-couches (`grid.rs`) et l'auto-équipement
+    /// des maisons NPC, où il n'y a pas de carte de tuiles.
+    pub fn add_solar(&mut self, s: SolarArray) {
+        self.solar.push(Placed::off_map(s));
+    }
+    /// Ajoute une éolienne non spatiale (env neutre).
+    pub fn add_wind(&mut self, t: WindTurbine) {
+        self.wind.push(Placed::off_map(t));
+    }
+    /// Ajoute une centrale thermique non spatiale (env neutre).
+    pub fn add_thermal(&mut self, t: ThermalPlant) {
+        self.thermal.push(Placed::off_map(t));
+    }
+    /// Ajoute de la capacité batterie (fusionne avec l'existante), sans budget.
+    pub fn add_battery(&mut self, capacity_kwh: f64) {
+        match &mut self.battery {
+            Some(b) => {
+                b.capacity_kwh += capacity_kwh;
+                b.max_charge_kw += capacity_kwh * 0.5;
+                b.max_discharge_kw += capacity_kwh * 0.5;
+            }
+            None => self.battery = Some(Battery::new(capacity_kwh)),
+        }
+    }
+
+    /// **Équilibrage local** *renouvelable + batterie seulement* (sans centrales
+    /// pilotables), *pur* : il produit le renouvelable, applique la batterie
+    /// mutualisée et renvoie le **résidu signé** (cf. [`ParkDispatch`],
+    /// `thermal_kwh = 0`). C'est la **première passe** d'un nœud du réseau : on
+    /// équilibre la charge locale avant d'agréger les enfants, puis on ne lance
+    /// les centrales (`cover_with_thermal`) que sur le déficit *agrégé*.
     ///
-    /// - `load_kw` : la charge à couvrir sur ce pas.
+    /// - `load_kw` : charge à couvrir sur ce pas.
     /// - `line_loss` : pertes en ligne (0..1) d'un actif posé en `(x, y)` vers le
     ///   point de charge. Renvoie `0.0` pour un parc non spatial (env neutre).
-    /// - La fonction **ne touche ni au budget ni au CO₂ cumulés** : elle se
-    ///   contente de *rapporter* `fuel_cost_eur` et `co2_kg` ; l'appelant décide
-    ///   quoi en faire (les imputer à un `Wallet`, à l'`Economy`, etc.).
-    pub fn dispatch(
+    pub fn balance_local(
         &mut self,
         load_kw: f64,
         weather: &Weather,
@@ -143,9 +166,8 @@ impl Park {
     ) -> ParkDispatch {
         let mut d = ParkDispatch::default();
 
-        // 1. Production renouvelable : puissance brute produite par filière, et
-        //    puissance livrée (après pertes en ligne) qui alimente réellement la
-        //    charge locale.
+        // Production renouvelable : puissance brute par filière, et puissance
+        // livrée (après pertes en ligne) qui alimente réellement la charge.
         let mut renewable_kw = 0.0;
         for p in &self.wind {
             let gen = p.asset.power_kw(weather.wind_ms * p.env.wind_factor);
@@ -170,9 +192,7 @@ impl Park {
         }
 
         let net_kwh = (renewable_kw - load_kw) * dt_h;
-
         if net_kwh >= 0.0 {
-            // Surplus : batterie d'abord, le reste devient un résidu positif.
             let mut surplus = net_kwh;
             if let Some(b) = &mut self.battery {
                 let charged = b.charge(surplus, dt_h);
@@ -181,39 +201,84 @@ impl Park {
             }
             d.residual_kwh = surplus;
         } else {
-            // Déficit : batterie puis centrales pilotables ; le reste est un
-            // résidu négatif (à couvrir par le réseau/parent, sinon black-out).
             let mut deficit = -net_kwh;
-
             if let Some(b) = &mut self.battery {
                 let dis = b.discharge(deficit, dt_h);
                 d.battery_kwh += dis;
                 deficit -= dis;
             }
-
-            for plant in &self.thermal {
-                if deficit <= EPS { break; }
-                let loss = line_loss(plant.x, plant.y);
-                let asset = &plant.asset;
-                // Énergie livrable au point de charge après pertes ; on couvre le
-                // déficit avec la part livrée, mais on brûle (et émet pour) la
-                // part produite.
-                let deliverable = asset.max_energy_kwh(dt_h) * (1.0 - loss);
-                let delivered = deliverable.min(deficit);
-                if delivered <= 0.0 { continue; }
-                let gen = delivered / (1.0 - loss);
-                deficit -= delivered;
-                d.thermal_kwh += gen;
-                d.loss_kwh += gen - delivered;
-                d.fuel_cost_eur += gen * asset.fuel_cost_eur_per_kwh();
-                d.co2_kg += Economy::co2_of_fuel(asset.kind, gen);
-            }
-
             d.residual_kwh = -deficit;
         }
-
         d
     }
+
+    /// **Couverture par centrales pilotables** : brûle du combustible pour livrer
+    /// jusqu'à `deficit_kwh` (>0) au point de charge. *Pure* : rapporte le
+    /// combustible et le CO₂ sans rien débiter. C'est la **passe de couverture**
+    /// du déficit *agrégé* d'un nœud (après local + enfants + P2P).
+    pub fn cover_with_thermal(
+        &mut self,
+        deficit_kwh: f64,
+        dt_h: f64,
+        line_loss: impl Fn(u16, u16) -> f64,
+    ) -> ThermalCover {
+        let mut tc = ThermalCover::default();
+        let mut deficit = deficit_kwh.max(0.0);
+        for plant in &self.thermal {
+            if deficit <= EPS { break; }
+            let loss = line_loss(plant.x, plant.y).clamp(0.0, 0.99);
+            let asset = &plant.asset;
+            // Énergie livrable au point de charge après pertes ; on couvre le
+            // déficit avec la part livrée, mais on brûle (et émet pour) la part
+            // produite.
+            let deliverable = asset.max_energy_kwh(dt_h) * (1.0 - loss);
+            let delivered = deliverable.min(deficit);
+            if delivered <= 0.0 { continue; }
+            let gen = delivered / (1.0 - loss);
+            deficit -= delivered;
+            tc.thermal_kwh += gen;
+            tc.delivered_kwh += delivered;
+            tc.loss_kwh += gen - delivered;
+            tc.fuel_cost_eur += gen * asset.fuel_cost_eur_per_kwh();
+            tc.co2_kg += Economy::co2_of_fuel(asset.kind, gen);
+        }
+        tc
+    }
+
+    /// **Dispatch local complet** (renouvelable → batterie → centrales) : compose
+    /// [`balance_local`](Self::balance_local) puis [`cover_with_thermal`](Self::cover_with_thermal).
+    /// C'est ce que consomme le jeu mono-carte (`SimState::tick`) : un nœud sans
+    /// enfants se comporte donc *exactement* comme avant.
+    pub fn dispatch(
+        &mut self,
+        load_kw: f64,
+        weather: &Weather,
+        dt_h: f64,
+        line_loss: impl Fn(u16, u16) -> f64,
+    ) -> ParkDispatch {
+        let mut d = self.balance_local(load_kw, weather, dt_h, &line_loss);
+        if d.residual_kwh < 0.0 {
+            let tc = self.cover_with_thermal(-d.residual_kwh, dt_h, &line_loss);
+            d.thermal_kwh = tc.thermal_kwh;
+            d.loss_kwh += tc.loss_kwh;
+            d.co2_kg += tc.co2_kg;
+            d.fuel_cost_eur += tc.fuel_cost_eur;
+            d.residual_kwh += tc.delivered_kwh; // résidu moins négatif
+        }
+        d
+    }
+}
+
+/// Apport des centrales pilotables sur un pas (cf. [`Park::cover_with_thermal`]).
+#[derive(Clone, Debug, Default)]
+pub struct ThermalCover {
+    /// Énergie thermique brute produite (kWh).
+    pub thermal_kwh: f64,
+    /// Énergie effectivement livrée au point de charge (kWh).
+    pub delivered_kwh: f64,
+    pub loss_kwh: f64,
+    pub co2_kg: f64,
+    pub fuel_cost_eur: f64,
 }
 
 /// Résultat du [`Park::dispatch`] sur un pas de temps. Toutes les énergies sont
