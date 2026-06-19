@@ -34,6 +34,22 @@ src/
 └── wasm.rs       Façade wasm-bindgen : Game (mono-carte) + GridGame (réseau)
 ```
 
+## Genèse
+
+Ce projet est né pour un **hackathon DefendIntelligence**. Faute de temps de
+développement, il n'a finalement **pas été soumis** — mais le sujet était trop
+intéressant pour le laisser tomber, alors il a continué d'évoluer après coup.
+
+L'idée de départ : modéliser **honnêtement** un système énergétique, et laisser
+une vraie tension *émerger de la mécanique* plutôt que de la scripter. D'un petit
+jeu de **village mono-carte** (foyers, appareils, météo, dispatch), il a grandi
+vers un **réseau multi-couches** (maison → quartier → national) où apparaît la
+« spirale de la mort » des réseaux : plus on autoproduit, plus le réseau central
+perd des revenus, plus il monte ses tarifs, plus les gens décrochent…
+
+Bref, un prototype inachevé côté soumission, mais un bac à sable qui marche, testé
+et déterministe. C'était surtout **sympa à coder**. 🙂
+
 ### Réseau énergétique multi-couches (national / quartier / maison)
 
 Au-dessus du jeu mono-carte, `grid.rs` modélise le réseau comme une **hiérarchie
