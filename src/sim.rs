@@ -19,6 +19,12 @@ use crate::weather::Weather;
 const HOURS_PER_YEAR: f64 = 8760.0;
 const EPS: f64 = 1e-6;
 
+/// Confort moyen du village (%) au-dessus duquel de nouveaux colons emménagent
+/// (au plus un par jour, s'il reste de la place).
+const ARRIVE_COMFORT: f64 = 75.0;
+/// Confort individuel (%) en dessous duquel un habitant **quitte** le village.
+const DEPART_COMFORT: f64 = 15.0;
+
 /// Facteurs de terrain capturés à la pose d'un actif : ils **modulent** les
 /// entrées de la physique (`physics.rs`) sans changer aucune formule
 /// (`vent_local = météo.vent × wind_factor`, idem soleil et débit d'eau). Un
@@ -126,6 +132,10 @@ pub struct TickReport {
     pub avg_comfort_pct: f64,
     /// Population totale du village (somme des habitants des bâtiments).
     pub population: u32,
+    /// Nombre de colons arrivés à ce pas (emménagement).
+    pub arrivals: u32,
+    /// Nombre de colons partis à ce pas (mécontents).
+    pub departures: u32,
     /// Revenu instantané du village (€/jour) : salaires/pensions des habitants,
     /// pondérés par leur confort. Crédité au budget à chaque pas de temps.
     pub revenue_eur_day: f64,
@@ -153,6 +163,10 @@ pub struct SimState {
     next_building_id: u32,
     /// Compteur d'identifiants d'appareils, unique sur tout le village.
     next_appliance_id: u32,
+    /// Compteur pour nommer les nouveaux arrivants.
+    next_newcomer: u32,
+    /// Dernier jour où l'on a évalué l'arrivée d'un colon (1 arrivée max/jour).
+    last_pop_day: u32,
 }
 
 impl SimState {
@@ -168,7 +182,42 @@ impl SimState {
             occupied: Vec::new(),
             next_building_id: 0,
             next_appliance_id: 0,
+            next_newcomer: 0,
+            last_pop_day: 1,
         }
+    }
+
+    /// Dynamique de population : les colons **mécontents partent** (confort sous
+    /// `DEPART_COMFORT`), et si la colonie est **accueillante** (confort moyen
+    /// au-dessus de `ARRIVE_COMFORT`) un nouvel habitant **emménage** dans le
+    /// premier foyer ayant de la place (au plus un par jour). Déterministe.
+    /// Renvoie `(arrivées, départs)` pour ce pas.
+    fn population_step(&mut self, avg_comfort: f64) -> (u32, u32) {
+        // Départs immédiats des habitants trop mécontents.
+        let mut departures = 0u32;
+        for b in &mut self.buildings {
+            let before = b.residents.len();
+            b.residents.retain(|r| r.comfort >= DEPART_COMFORT);
+            departures += (before - b.residents.len()) as u32;
+        }
+        // Arrivée : au plus une par jour, si la colonie est accueillante.
+        let mut arrivals = 0u32;
+        if self.day != self.last_pop_day {
+            self.last_pop_day = self.day;
+            if avg_comfort >= ARRIVE_COMFORT {
+                if let Some(idx) = self
+                    .buildings
+                    .iter()
+                    .position(|b| b.residents.len() < b.kind.capacity())
+                {
+                    self.next_newcomer += 1;
+                    let name = format!("Colon {}", self.next_newcomer);
+                    self.buildings[idx].add_resident(name, ResidentProfile::Worker);
+                    arrivals = 1;
+                }
+            }
+        }
+        (arrivals, departures)
     }
 
     /// Génère la carte de terrain depuis un seed (500×500 par défaut) et réinit
@@ -616,6 +665,10 @@ impl SimState {
             self.day += 1;
         }
 
+        // 5. Dynamique de population : arrivées (colonie accueillante) et
+        //    départs (colons mécontents).
+        let (arrivals, departures) = self.population_step(avg_comfort_pct);
+
         let inv_dt = if dt_h > 0.0 { 1.0 / dt_h } else { 0.0 };
         TickReport {
             hour: self.hour,
@@ -637,6 +690,8 @@ impl SimState {
             co2_kg_total: self.economy.co2_kg,
             avg_comfort_pct,
             population,
+            arrivals,
+            departures,
             revenue_eur_day,
             buildings: building_reports,
         }
@@ -890,6 +945,49 @@ mod tests {
         // Le village "happy" n'a pas de prod non plus ici, mais ses habitants ne
         // subissent pas de black-out tant qu'il reste raccordé au réseau.
         assert!(last_happy > last_sad, "le black-out réduit le revenu ({last_happy} > {last_sad})");
+    }
+
+    #[test]
+    fn happy_colony_attracts_newcomers() {
+        // Village bien alimenté (réseau on, confort à 100) : un colon emménage
+        // au passage d'un jour, tant qu'il reste de la place.
+        let mut s = SimState::new(50_000.0);
+        s.add_building(BuildingKind::Studio); // 1 actif, capacité 2
+        s.hour = 23.0;
+        let pop_before = 1;
+        let r = s.tick(&weather(0.0, 0.0), 1.5); // franchit minuit
+        assert!(!r.blackout, "réseau on -> pas de black-out");
+        assert_eq!(r.arrivals, 1, "un colon doit arriver dans une colonie heureuse");
+        assert_eq!(s.buildings[0].residents.len(), pop_before + 1);
+    }
+
+    #[test]
+    fn unhappy_colonists_leave() {
+        // Black-out prolongé -> le confort s'effondre -> les colons partent.
+        let mut s = SimState::new(50_000.0);
+        s.economy.grid.connected = false;
+        s.add_building(BuildingKind::Family); // 2 habitants
+        s.hour = 12.0; // éveillés
+        let mut total_departures = 0u32;
+        for _ in 0..12 {
+            total_departures += s.tick(&weather(0.0, 0.0), 1.0).departures;
+        }
+        assert!(total_departures >= 1, "des colons mécontents doivent partir");
+        assert!(
+            s.buildings[0].residents.len() < 2,
+            "le foyer s'est vidé, reste {}",
+            s.buildings[0].residents.len()
+        );
+    }
+
+    #[test]
+    fn full_colony_stops_attracting() {
+        // Si tous les foyers sont pleins, plus d'arrivée même en étant heureux.
+        let mut s = SimState::new(50_000.0);
+        s.add_building(BuildingKind::Elders); // capacité 2, déjà 2 habitants -> plein
+        s.hour = 23.0;
+        let r = s.tick(&weather(0.0, 0.0), 1.5);
+        assert_eq!(r.arrivals, 0, "aucune place -> aucune arrivée");
     }
 
     #[test]

@@ -62,6 +62,8 @@ export interface TickReport {
   co2_kg_total: number;
   avg_comfort_pct: number;
   population: number;
+  arrivals: number;
+  departures: number;
   revenue_eur_day: number;
   buildings: BuildingReport[];
 }
