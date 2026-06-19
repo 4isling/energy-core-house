@@ -2,143 +2,163 @@ import { useState } from "react";
 import type { GameApi } from "../useGame";
 import {
   APPLIANCE_CATALOG,
+  BUILD_TOOLS,
   RESIDENT_PROFILES,
-  type ApplianceView,
+  type BuildTool,
+  type BuildingView,
 } from "../types";
 
-// CAPEX (cf. src/economy.rs) pour griser les boutons si budget insuffisant.
-const SOLAR_KWC = 6;
-const BATTERY_KWH = 10;
-const COST = {
-  solar: SOLAR_KWC * 1100, // 1100 €/kWc
-  windMicro: 5 * 1850, // 1850 €/kW, micro = 5 kW
-  battery: BATTERY_KWH * 600, // 600 €/kWh
-  genset: 6 * 900, // 900 €/kW, genset = 6 kW
-};
-
+// Palette de construction (sélection d'un outil) + gestion des foyers.
+// La pose se fait ensuite en cliquant une tuile de la carte.
 export function BuildMenu({
   game,
   budget,
+  selectedTool,
+  onSelectTool,
 }: {
   game: GameApi;
   budget: number;
+  selectedTool: BuildTool | null;
+  onSelectTool: (t: BuildTool | null) => void;
 }) {
-  const [name, setName] = useState("Habitant");
-  const [profile, setProfile] = useState(RESIDENT_PROFILES[0].code);
+  const { buildings } = game;
+  const [selected, setSelected] = useState<number | null>(null);
+  const current = buildings.find((b) => b.id === selected) ?? buildings[0] ?? null;
+
+  const energy = BUILD_TOOLS.filter((t) => t.category === "energy");
+  const homes = BUILD_TOOLS.filter((t) => t.category === "building");
 
   return (
     <aside className="build-menu">
       <section>
-        <h2>Production</h2>
-        <BuildBtn
-          label={`☀️ Solaire ${SOLAR_KWC} kWc`}
-          cost={COST.solar}
-          budget={budget}
-          onClick={() => game.buildSolar(SOLAR_KWC)}
-        />
-        <BuildBtn
-          label="🌬️ Micro-éolien 5 kW"
-          cost={COST.windMicro}
-          budget={budget}
-          onClick={game.buildWindMicro}
-        />
-        <BuildBtn
-          label={`🔋 Batterie ${BATTERY_KWH} kWh`}
-          cost={COST.battery}
-          budget={budget}
-          onClick={() => game.buildBattery(BATTERY_KWH)}
-        />
-        <BuildBtn
-          label="⛽ Groupe électrogène 6 kW"
-          cost={COST.genset}
-          budget={budget}
-          onClick={game.buildGenset}
-        />
+        <h2>Construire</h2>
+        <p className="muted">
+          {selectedTool
+            ? `Cliquez une tuile pour poser : ${selectedTool.label}.`
+            : "Choisissez un élément, puis cliquez une tuile."}
+        </p>
+        <div className="palette">
+          {energy.map((t) => (
+            <ToolBtn key={t.id} tool={t} budget={budget} selected={selectedTool?.id === t.id} onSelect={onSelectTool} />
+          ))}
+        </div>
+        <h3>Foyers</h3>
+        <div className="palette">
+          {homes.map((t) => (
+            <ToolBtn key={t.id} tool={t} budget={budget} selected={selectedTool?.id === t.id} onSelect={onSelectTool} />
+          ))}
+        </div>
       </section>
 
       <section>
-        <h2>Appareils</h2>
-        <div className="catalog">
-          {APPLIANCE_CATALOG.map((a) => (
-            <button key={a.code} onClick={() => game.addAppliance(a.code)}>
-              + {a.label}
-              <span className="power">{a.power_kw} kW</span>
-            </button>
-          ))}
-        </div>
-        <ApplianceList
-          appliances={game.appliances}
-          onToggle={game.toggleAppliance}
-        />
-      </section>
-
-      <section>
-        <h2>Habitants</h2>
-        <div className="resident-form">
-          <input value={name} onChange={(e) => setName(e.target.value)} />
-          <select value={profile} onChange={(e) => setProfile(e.target.value)}>
-            {RESIDENT_PROFILES.map((p) => (
-              <option key={p.code} value={p.code}>
-                {p.label}
-              </option>
-            ))}
-          </select>
-          <button onClick={() => game.addResident(name, profile)}>
-            + Ajouter
-          </button>
-        </div>
-        <ul className="resident-list">
-          {game.residents.map((r, i) => (
-            <li key={i}>
-              👤 {r.name} ({r.profile}) — confort {r.comfort.toFixed(0)} %
-            </li>
-          ))}
-        </ul>
+        <h2>Gérer un foyer</h2>
+        {current ? (
+          <ManageBuilding game={game} buildings={buildings} current={current} onSelect={setSelected} />
+        ) : (
+          <p className="muted">Construisez un foyer pour le gérer.</p>
+        )}
       </section>
     </aside>
   );
 }
 
-function BuildBtn({
-  label,
-  cost,
+function ToolBtn({
+  tool,
   budget,
-  onClick,
+  selected,
+  onSelect,
 }: {
-  label: string;
-  cost: number;
+  tool: BuildTool;
   budget: number;
-  onClick: () => void;
+  selected: boolean;
+  onSelect: (t: BuildTool | null) => void;
 }) {
-  const affordable = budget >= cost;
+  const affordable = budget >= tool.cost;
   return (
-    <button className="build-btn" disabled={!affordable} onClick={onClick}>
-      {label}
-      <span className="cost">{cost.toLocaleString("fr-FR")} €</span>
+    <button
+      className={`tool-btn${selected ? " selected" : ""}`}
+      disabled={!affordable}
+      title={tool.detail}
+      onClick={() => onSelect(selected ? null : tool)}
+    >
+      <span className="tool-emoji">{tool.emoji}</span>
+      <span className="tool-label">{tool.label}</span>
+      <span className="cost">{tool.cost.toLocaleString("fr-FR")} €</span>
     </button>
   );
 }
 
-function ApplianceList({
-  appliances,
-  onToggle,
+function ManageBuilding({
+  game,
+  buildings,
+  current,
+  onSelect,
 }: {
-  appliances: ApplianceView[];
-  onToggle: (id: number) => void;
+  game: GameApi;
+  buildings: BuildingView[];
+  current: BuildingView;
+  onSelect: (id: number) => void;
 }) {
-  if (appliances.length === 0) {
-    return <p className="muted">Aucun appareil installé.</p>;
-  }
+  const [name, setName] = useState("Habitant");
+  const [profile, setProfile] = useState(RESIDENT_PROFILES[0].code);
+
   return (
-    <ul className="appliance-list">
-      {appliances.map((a) => (
-        <li key={a.id} className={a.on ? "on" : "off"}>
-          <button onClick={() => onToggle(a.id)}>
-            <span className="dot" /> {a.name}
+    <>
+      <select
+        className="building-select"
+        value={current.id}
+        onChange={(e) => onSelect(Number(e.target.value))}
+      >
+        {buildings.map((b) => (
+          <option key={b.id} value={b.id}>
+            {b.name} #{b.id} — {b.residents.length} hab.
+          </option>
+        ))}
+      </select>
+
+      <h3>Appareils</h3>
+      <div className="catalog">
+        {APPLIANCE_CATALOG.map((a) => (
+          <button key={a.code} onClick={() => game.addApplianceTo(current.id, a.code)}>
+            + {a.label}
+            <span className="power">{a.power_kw} kW</span>
           </button>
-          <span className="power">{a.power_kw} kW</span>
-        </li>
-      ))}
-    </ul>
+        ))}
+      </div>
+      {current.appliances.length === 0 ? (
+        <p className="muted">Aucun appareil installé.</p>
+      ) : (
+        <ul className="appliance-list">
+          {current.appliances.map((a) => (
+            <li key={a.id} className={a.on ? "on" : "off"}>
+              <button onClick={() => game.toggleAppliance(a.id)}>
+                <span className="dot" /> {a.name}
+              </button>
+              <span className="power">{a.power_kw} kW</span>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      <h3>Habitants</h3>
+      <div className="resident-form">
+        <input value={name} onChange={(e) => setName(e.target.value)} />
+        <select value={profile} onChange={(e) => setProfile(e.target.value)}>
+          {RESIDENT_PROFILES.map((p) => (
+            <option key={p.code} value={p.code}>
+              {p.label}
+            </option>
+          ))}
+        </select>
+        <button onClick={() => game.addResidentTo(current.id, name, profile)}>+ Ajouter</button>
+      </div>
+      <ul className="resident-list">
+        {current.residents.map((r, i) => (
+          <li key={i}>
+            👤 {r.name} ({r.profile}) — confort {r.comfort.toFixed(0)} %
+          </li>
+        ))}
+      </ul>
+    </>
   );
 }

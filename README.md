@@ -30,15 +30,20 @@ src/
 └── wasm.rs       Façade wasm-bindgen (feature "wasm")
 ```
 
-### Jeu « maison autonome »
+### Jeu « village micro-réseau »
 
-Le même cœur sert un jeu de gestion de **maison autonome** : presets à l'échelle
-maison (`WindTurbine::micro()` ~5 kW, `ThermalPlant::genset()` ~6 kW, solaire kWc,
-batterie kWh), des **appareils** (`appliance.rs`) que le joueur ajoute, et des
-**habitants** (`resident.rs`) dont les routines déterministes allument/éteignent
-ces appareils — c'est ce qui fait vivre la courbe de consommation. La charge d'un
-pas = somme des appareils allumés. Un black-out pendant qu'un habitant est éveillé
-fait baisser son confort (`TickReport.avg_comfort_pct`).
+Le même cœur sert un jeu de gestion de **colonie / village** centré sur l'énergie.
+Le joueur gère plusieurs **bâtiments** (`building.rs`, foyers de types Studio /
+Family / Elders) reliés à un **micro-réseau partagé** : la production (`WindTurbine::micro()`
+~5 kW, `ThermalPlant::genset()` ~6 kW, solaire kWc) et le stockage (batterie kWh)
+sont mutualisés (`Park`), tandis que chaque bâtiment porte ses **appareils**
+(`appliance.rs`) et ses **habitants** (`resident.rs`) dont les routines déterministes
+allument/éteignent ces appareils. La demande du village = somme des bâtiments. Le
+dispatch équilibre cette demande agrégée ; un black-out fait baisser le confort de
+tous les colons (`TickReport.avg_comfort_pct`, détail par bâtiment dans
+`TickReport.buildings`). La boucle : faire **grandir** la colonie (nouveaux foyers →
+plus d'habitants → plus de demande), **dimensionner** le réseau pour éviter les
+black-out, et garder les colons **confortables** sous contrainte de budget et de CO₂.
 
 Un front web React + WASM vit dans `web/` (dashboard + graphes + schéma SVG
 animé) :
@@ -56,29 +61,37 @@ renouvelable → batterie → thermique → réseau → non-fourni (black-out).
 
 ### Natif + tests
 ```bash
-cargo test          # 18 tests unitaires + doctest
+cargo test          # tests unitaires + doctest
 cargo build --release
 ```
 
 ### WASM pour le web
 ```bash
 # une fois : cargo install wasm-pack
-wasm-pack build --target web --features wasm --out-dir ../web/pkg
+wasm-pack build --target web --features wasm --out-dir web/src/pkg
+```
+Si `wasm-pack` est incompatible avec votre version de cargo (flag `--out-dir` /
+`--artifact-dir`), repli manuel équivalent :
+```bash
+cargo build --target wasm32-unknown-unknown --release --features wasm
+wasm-bindgen target/wasm32-unknown-unknown/release/energy_core.wasm \
+  --out-dir web/src/pkg --target web
 ```
 Puis côté front :
 ```js
 import init, { Game } from "./pkg/energy_core.js";
 
 await init();
-const game = new Game(50_000, 1234);   // budget €, seed météo
-game.build_solar(6.0);                  // 6 kWc
-game.build_battery(10.0);               // 10 kWh
-game.set_load_kw(2.5);
+const game = new Game(120_000, 1234);   // budget €, seed météo ; village de départ peuplé
+game.build_solar(6.0);                   // 6 kWc, prod partagée
+game.build_battery(10.0);                // 10 kWh, stockage partagé
+const id = game.build_building("family"); // nouveau foyer (CAPEX débité)
+game.add_appliance_to(id, "ev_charger"); // appareil dans ce foyer
 
 // boucle de jeu (la météo est générée dans le core, déterministe)
 setInterval(() => {
   const report = game.tick(0.5);        // avance de 30 min, renvoie un objet JS
-  render(report);                       // report.wind_kw, .soc_pct, .blackout, .budget_eur…
+  render(report);                       // report.population, .load_kw, .blackout, .buildings…
 }, 250);
 ```
 
