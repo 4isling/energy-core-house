@@ -31,6 +31,11 @@ export function Dashboard({ report }: { report: TickReport }) {
       <Gauge label="Confort du village" pct={report.avg_comfort_pct} />
       <Stat label="Demande" value={`${report.load_kw.toFixed(2)} kW`} />
       <Stat
+        label="Pertes lignes"
+        value={`🔌 ${report.loss_kw.toFixed(2)} kW`}
+        warn={report.loss_kw > 0.2 * report.load_kw && report.loss_kw > 0.1}
+      />
+      <Stat
         label={net >= 0 ? "Import réseau" : "Export réseau"}
         value={`${Math.abs(net).toFixed(2)} kW`}
       />

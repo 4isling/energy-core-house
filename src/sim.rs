@@ -34,6 +34,13 @@ const CROWD_THRESHOLD: f64 = 0.85;
 /// se dégrade lentement → il faut agrandir avant que les colons ne partent.
 const CROWD_PENALTY: f64 = 3.0;
 
+/// Pertes en ligne par tuile de distance entre un producteur et le **hub** de
+/// distribution (centre du village) : 0,5 % de la puissance transportée par tuile.
+/// Plus la ligne est longue, plus on perd → il faut produire **près des foyers**.
+const LOSS_PER_TILE: f64 = 0.005;
+/// Plafond des pertes en ligne (une ligne très longue ne perd jamais tout).
+const LOSS_MAX: f64 = 0.40;
+
 /// Facteurs de terrain capturés à la pose d'un actif : ils **modulent** les
 /// entrées de la physique (`physics.rs`) sans changer aucune formule
 /// (`vent_local = météo.vent × wind_factor`, idem soleil et débit d'eau). Un
@@ -129,6 +136,9 @@ pub struct TickReport {
     pub import_kw: f64,
     pub export_kw: f64,
     pub load_kw: f64,
+    /// Puissance perdue dans les lignes électriques (kW) à ce pas : croît avec la
+    /// distance producteurs ↔ hub. Produire loin des foyers la fait grimper.
+    pub loss_kw: f64,
     pub unmet_kw: f64,
     pub blackout: bool,
     pub soc_pct: f64,
@@ -206,6 +216,34 @@ impl SimState {
     /// Capacité d'accueil totale du village (somme des capacités des foyers).
     pub fn total_capacity(&self) -> usize {
         self.buildings.iter().map(|b| b.kind.capacity()).sum()
+    }
+
+    /// **Hub de distribution** : le centre de charge du village, vers lequel
+    /// converge l'énergie de tous les producteurs. C'est le barycentre des foyers
+    /// (les bâtiments). `None` s'il n'y a aucun foyer (pas de réseau à alimenter,
+    /// donc pas de pertes — cas des tests non spatiaux où tout est à l'origine).
+    pub fn distribution_hub(&self) -> Option<(f64, f64)> {
+        if self.buildings.is_empty() {
+            return None;
+        }
+        let n = self.buildings.len() as f64;
+        let sx: f64 = self.buildings.iter().map(|b| b.x as f64).sum();
+        let sy: f64 = self.buildings.iter().map(|b| b.y as f64).sum();
+        Some((sx / n, sy / n))
+    }
+
+    /// Fraction de puissance **perdue en ligne** pour un actif posé en `(x, y)`,
+    /// proportionnelle à la distance au hub (bornée par `LOSS_MAX`). 0 sans hub.
+    pub fn line_loss_frac(&self, x: u16, y: u16) -> f64 {
+        match self.distribution_hub() {
+            Some((hx, hy)) => {
+                let dx = x as f64 - hx;
+                let dy = y as f64 - hy;
+                let dist = (dx * dx + dy * dy).sqrt();
+                (dist * LOSS_PER_TILE).clamp(0.0, LOSS_MAX)
+            }
+            None => 0.0,
+        }
     }
 
     /// Dynamique de population (déterministe). Renvoie `(arrivées, départs)`.
@@ -587,13 +625,35 @@ impl SimState {
         // 1. Production renouvelable instantanée (kW), mutualisée sur le réseau.
         //    Chaque actif utilise la météo **modulée par sa tuile** (terrain) :
         //    crête ventée, versant ombragé, gros débit de rivière, etc.
-        let wind_kw: f64 = self.park.wind.iter()
-            .map(|p| p.asset.power_kw(weather.wind_ms * p.env.wind_factor)).sum();
-        let solar_kw: f64 = self.park.solar.iter()
-            .map(|p| p.asset.power_kw(weather.irradiance_kw_m2 * p.env.solar_factor, weather.air_temp_c)).sum();
-        let hydro_kw: f64 = self.park.hydro.iter()
-            .map(|p| p.asset.power_kw(weather.river_flow_m3s * p.env.water_factor)).sum();
-        let renewable_kw = wind_kw + solar_kw + hydro_kw;
+        //    La puissance **produite** (rapportée à l'UI) traverse ensuite une
+        //    ligne vers le hub : seule la part **livrée** (après pertes) alimente
+        //    le réseau. `loss_kwh` cumule l'énergie dissipée dans les lignes.
+        let mut loss_kwh = 0.0;
+        let mut wind_kw = 0.0;
+        let mut solar_kw = 0.0;
+        let mut hydro_kw = 0.0;
+        let mut renewable_kw = 0.0; // puissance livrée au hub (après pertes)
+        for p in &self.park.wind {
+            let gen = p.asset.power_kw(weather.wind_ms * p.env.wind_factor);
+            let delivered = gen * (1.0 - self.line_loss_frac(p.x, p.y));
+            wind_kw += gen;
+            renewable_kw += delivered;
+            loss_kwh += (gen - delivered) * dt_h;
+        }
+        for p in &self.park.solar {
+            let gen = p.asset.power_kw(weather.irradiance_kw_m2 * p.env.solar_factor, weather.air_temp_c);
+            let delivered = gen * (1.0 - self.line_loss_frac(p.x, p.y));
+            solar_kw += gen;
+            renewable_kw += delivered;
+            loss_kwh += (gen - delivered) * dt_h;
+        }
+        for p in &self.park.hydro {
+            let gen = p.asset.power_kw(weather.river_flow_m3s * p.env.water_factor);
+            let delivered = gen * (1.0 - self.line_loss_frac(p.x, p.y));
+            hydro_kw += gen;
+            renewable_kw += delivered;
+            loss_kwh += (gen - delivered) * dt_h;
+        }
 
         let net_kwh = (renewable_kw - load_kw) * dt_h;
 
@@ -628,12 +688,19 @@ impl SimState {
 
             for plant in &self.park.thermal {
                 if deficit <= EPS { break; }
-                let plant = &plant.asset;
-                let gen = plant.max_energy_kwh(dt_h).min(deficit);
-                deficit -= gen;
+                let loss = self.line_loss_frac(plant.x, plant.y);
+                let asset = &plant.asset;
+                // Énergie livrable au hub après pertes ; on couvre le déficit avec
+                // la part livrée, mais on brûle (et émet pour) la part produite.
+                let deliverable = asset.max_energy_kwh(dt_h) * (1.0 - loss);
+                let delivered = deliverable.min(deficit);
+                if delivered <= 0.0 { continue; }
+                let gen = delivered / (1.0 - loss);
+                deficit -= delivered;
                 thermal_kwh += gen;
-                self.economy.budget_eur -= gen * plant.fuel_cost_eur_per_kwh();
-                let c = economy::Economy::co2_of_fuel(plant.kind, gen);
+                loss_kwh += gen - delivered;
+                self.economy.budget_eur -= gen * asset.fuel_cost_eur_per_kwh();
+                let c = economy::Economy::co2_of_fuel(asset.kind, gen);
                 self.economy.co2_kg += c;
                 co2_step += c;
             }
@@ -722,6 +789,7 @@ impl SimState {
             import_kw: import_kwh * inv_dt,
             export_kw: export_kwh * inv_dt,
             load_kw,
+            loss_kw: loss_kwh * inv_dt,
             unmet_kw: unmet_kwh * inv_dt,
             blackout,
             soc_pct: self.park.battery.as_ref().map(|b| b.soc_pct()).unwrap_or(0.0),
@@ -1056,6 +1124,55 @@ mod tests {
             last = r.avg_comfort_pct;
         }
         assert!(last < start, "surpopulation -> confort en baisse ({last} < {start})");
+    }
+
+    #[test]
+    fn distant_producer_loses_more_in_lines() {
+        // Deux villages identiques hors réseau, alimentés par un seul solaire :
+        // celui dont le panneau est loin du foyer perd plus en ligne → moins
+        // d'énergie livrée → davantage de non-fourni (ou de déficit).
+        let make = |gx: u16, gy: u16, sx: u16, sy: u16| {
+            let mut s = SimState::new(10_000_000.0);
+            s.generate_map_sized(2024, 200, 200);
+            s.economy.grid.connected = false; // isole : pas d'import pour masquer la perte
+            // Force un foyer (le hub) et un panneau aux positions voulues, en
+            // contournant les contraintes de terrain pour un test déterministe.
+            let bid = s.add_building(BuildingKind::Family);
+            s.building_mut(bid).unwrap().place(gx, gy);
+            s.park.solar.push(Placed {
+                x: sx,
+                y: sy,
+                env: TileEnv::NEUTRAL,
+                asset: SolarArray::new(50.0),
+            });
+            s
+        };
+        // Panneau proche (2 tuiles) vs loin (120 tuiles) du foyer.
+        let mut near = make(100, 100, 102, 100);
+        let mut far = make(100, 100, 100, 199); // ~99 tuiles -> grosses pertes
+        let w = weather(0.0, 0.8); // plein soleil, pas de vent
+        let r_near = near.tick(&w, 1.0);
+        let r_far = far.tick(&w, 1.0);
+        assert!(
+            r_far.loss_kw > r_near.loss_kw,
+            "ligne plus longue -> plus de pertes ({} > {})",
+            r_far.loss_kw,
+            r_near.loss_kw
+        );
+        assert!(r_near.loss_kw > 0.0, "même proche, une ligne perd un peu");
+    }
+
+    #[test]
+    fn losses_grow_with_distance_to_hub() {
+        let mut s = SimState::new(1_000.0);
+        let bid = s.add_building(BuildingKind::Studio);
+        s.building_mut(bid).unwrap().place(50, 50);
+        let near = s.line_loss_frac(52, 50); // 2 tuiles
+        let far = s.line_loss_frac(50, 130); // 80 tuiles
+        assert!(far > near);
+        // Au-delà de la portée, les pertes plafonnent (jamais 100 %).
+        let huge = s.line_loss_frac(50, 60_000.min(u16::MAX as u32) as u16);
+        assert!(huge <= LOSS_MAX + 1e-9 && huge >= near);
     }
 
     #[test]

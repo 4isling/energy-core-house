@@ -11,7 +11,7 @@ import {
   Sprite,
   Texture,
 } from "pixi.js";
-import type { BuildTool, PlacementView, TerrainData } from "../types";
+import type { BuildTool, PlacementView, PowerLine, TerrainData } from "../types";
 
 const TILE = 16; // px par tuile à zoom 1
 const SPRITE_FILES = ["wind", "solar", "hydro", "genset", "battery", "house"];
@@ -76,18 +76,27 @@ function fallbackTexture(kind: string): Texture {
   return tex ?? Texture.WHITE;
 }
 
+// Couleur d'une ligne selon ses pertes : vert (faible) → orange → rouge (forte).
+function lossColor(lossPct: number): number {
+  if (lossPct < 8) return 0x49d17a;
+  if (lossPct < 20) return 0xf5b942;
+  return 0xe2483c;
+}
+
 interface Props {
   terrain: TerrainData;
   placements: PlacementView[];
+  lines: PowerLine[];
   selectedTool: BuildTool | null;
   onPlace: (x: number, y: number) => void;
   onHoverTile: (x: number, y: number) => void;
 }
 
-export function MapView({ terrain, placements, selectedTool, onPlace, onHoverTile }: Props) {
+export function MapView({ terrain, placements, lines, selectedTool, onPlace, onHoverTile }: Props) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const appRef = useRef<Application | null>(null);
   const worldRef = useRef<Container | null>(null);
+  const lineLayerRef = useRef<Graphics | null>(null);
   const placeLayerRef = useRef<Container | null>(null);
   const hiliteRef = useRef<Graphics | null>(null);
   const texRef = useRef<Map<string, Texture>>(new Map());
@@ -95,9 +104,11 @@ export function MapView({ terrain, placements, selectedTool, onPlace, onHoverTil
   const toolRef = useRef<BuildTool | null>(selectedTool);
   const placeCbRef = useRef(onPlace);
   const hoverCbRef = useRef(onHoverTile);
+  const linesRef = useRef<PowerLine[]>(lines);
   toolRef.current = selectedTool;
   placeCbRef.current = onPlace;
   hoverCbRef.current = onHoverTile;
+  linesRef.current = lines;
 
   // Init Pixi une seule fois (terrain fixe pour une partie).
   useEffect(() => {
@@ -125,6 +136,11 @@ export function MapView({ terrain, placements, selectedTool, onPlace, onHoverTil
       terrainSprite.height = terrain.height * TILE;
       world.addChild(terrainSprite);
 
+      // Lignes électriques (sous les sprites) : producteurs reliés au hub.
+      const lineLayer = new Graphics();
+      world.addChild(lineLayer);
+      lineLayerRef.current = lineLayer;
+
       const placeLayer = new Container();
       world.addChild(placeLayer);
       placeLayerRef.current = placeLayer;
@@ -143,7 +159,10 @@ export function MapView({ terrain, placements, selectedTool, onPlace, onHoverTil
           texRef.current.set(name, fallbackTexture(name));
         }
       }
-      if (!destroyed) drawPlacements();
+      if (!destroyed) {
+        drawLines();
+        drawPlacements();
+      }
 
       // Caméra : centrée, zoom pour voir une bonne portion de carte.
       const fit = Math.max(0.05, Math.min(host.clientWidth, host.clientHeight) / (60 * TILE));
@@ -169,6 +188,33 @@ export function MapView({ terrain, placements, selectedTool, onPlace, onHoverTil
     drawPlacements();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [placements]);
+
+  // Redessine le réseau de lignes quand il change (pose/retrait, hub déplacé).
+  useEffect(() => {
+    drawLines();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lines]);
+
+  // Trace les lignes producteur → hub, épaisseur/couleur selon les pertes.
+  function drawLines() {
+    const g = lineLayerRef.current;
+    if (!g) return;
+    g.clear();
+    const C = TILE / 2; // centre de tuile
+    for (const ln of linesRef.current) {
+      g.moveTo(ln.x1 * TILE + C, ln.y1 * TILE + C);
+      g.lineTo(ln.x2 * TILE + C, ln.y2 * TILE + C);
+      g.stroke({ width: 2.5, color: lossColor(ln.loss_pct), alpha: 0.85 });
+    }
+    // Marque le hub (barycentre des foyers) là où convergent les lignes.
+    const first = linesRef.current[0];
+    if (first) {
+      g.circle(first.x2 * TILE + C, first.y2 * TILE + C, TILE * 0.35).fill({
+        color: 0xffffff,
+        alpha: 0.5,
+      });
+    }
+  }
 
   function spriteFor(kind: PlacementView["kind"]): Texture {
     const file = kind === "building" ? "house" : kind;

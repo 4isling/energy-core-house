@@ -4,6 +4,7 @@ import type {
   BuildingView,
   BuildTool,
   PlacementView,
+  PowerLine,
   TerrainData,
   TickReport,
   TileInfo,
@@ -20,6 +21,7 @@ export interface GameApi {
   buildings: BuildingView[];
   terrain: TerrainData | null;
   placements: PlacementView[];
+  lines: PowerLine[];
   paused: boolean;
   gridConnected: boolean;
   togglePause: () => void;
@@ -41,6 +43,7 @@ export function useGame(budget: number, seed: number): GameApi {
   const [buildings, setBuildings] = useState<BuildingView[]>([]);
   const [terrain, setTerrain] = useState<TerrainData | null>(null);
   const [placements, setPlacements] = useState<PlacementView[]>([]);
+  const [lines, setLines] = useState<PowerLine[]>([]);
   const [paused, setPaused] = useState(false);
   const [gridConnected, setGridConnectedState] = useState(true);
 
@@ -51,11 +54,13 @@ export function useGame(budget: number, seed: number): GameApi {
     setBuildings(g.list_buildings() as BuildingView[]);
   }, []);
 
-  // Rafraîchit la liste des éléments posés sur la carte (pour le rendu).
+  // Rafraîchit la liste des éléments posés sur la carte (pour le rendu) et le
+  // réseau de lignes électriques (producteurs → hub) avec leurs pertes.
   const refreshPlacements = useCallback(() => {
     const g = gameRef.current;
     if (!g) return;
     setPlacements(g.list_placements() as PlacementView[]);
+    setLines(g.power_lines() as PowerLine[]);
   }, []);
 
   useEffect(() => {
@@ -185,6 +190,7 @@ export function useGame(budget: number, seed: number): GameApi {
     buildings,
     terrain,
     placements,
+    lines,
     paused,
     gridConnected,
     togglePause,

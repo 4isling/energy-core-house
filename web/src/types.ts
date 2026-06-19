@@ -17,6 +17,16 @@ export interface PlacementView {
   y: number;
 }
 
+// Une ligne électrique producteur → hub — reflète `PowerLineView` (src/wasm.rs).
+export interface PowerLine {
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+  kind: "wind" | "solar" | "hydro" | "genset";
+  loss_pct: number;
+}
+
 // Infos d'une tuile — reflète `TileInfoView` (src/wasm.rs).
 export interface TileInfo {
   x: number;
@@ -53,6 +63,7 @@ export interface TickReport {
   import_kw: number;
   export_kw: number;
   load_kw: number;
+  loss_kw: number; // pertes en ligne (distance producteurs ↔ hub)
   unmet_kw: number;
   blackout: boolean;
   soc_pct: number;

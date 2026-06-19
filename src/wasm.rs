@@ -33,6 +33,19 @@ struct PlacementView {
     y: u16,
 }
 
+/// Une ligne électrique producteur → hub, pour le rendu (`power_lines`).
+/// `(x1,y1)` = actif posé, `(x2,y2)` = hub de distribution (barycentre des foyers),
+/// `loss_pct` = pertes en ligne (%) dues à la distance.
+#[derive(Serialize)]
+struct PowerLineView {
+    x1: u16,
+    y1: u16,
+    x2: f64,
+    y2: f64,
+    kind: &'static str,
+    loss_pct: f64,
+}
+
 /// Infos d'une tuile pour l'infobulle (`tile_info`).
 #[derive(Serialize)]
 struct TileInfoView {
@@ -278,6 +291,27 @@ impl Game {
         }
         for b in &self.sim.buildings {
             v.push(PlacementView { kind: "building", x: b.x, y: b.y });
+        }
+        serde_wasm_bindgen::to_value(&v).map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// Lignes électriques producteur → hub (objets JS : x1,y1,x2,y2,kind,loss_pct)
+    /// pour dessiner le réseau et ses pertes. Vide tant qu'aucun foyer n'existe.
+    pub fn power_lines(&self) -> Result<JsValue, JsValue> {
+        let mut v: Vec<PowerLineView> = Vec::new();
+        if let Some((hx, hy)) = self.sim.distribution_hub() {
+            for p in &self.sim.park.wind {
+                v.push(PowerLineView { x1: p.x, y1: p.y, x2: hx, y2: hy, kind: "wind", loss_pct: self.sim.line_loss_frac(p.x, p.y) * 100.0 });
+            }
+            for p in &self.sim.park.solar {
+                v.push(PowerLineView { x1: p.x, y1: p.y, x2: hx, y2: hy, kind: "solar", loss_pct: self.sim.line_loss_frac(p.x, p.y) * 100.0 });
+            }
+            for p in &self.sim.park.hydro {
+                v.push(PowerLineView { x1: p.x, y1: p.y, x2: hx, y2: hy, kind: "hydro", loss_pct: self.sim.line_loss_frac(p.x, p.y) * 100.0 });
+            }
+            for p in &self.sim.park.thermal {
+                v.push(PowerLineView { x1: p.x, y1: p.y, x2: hx, y2: hy, kind: "genset", loss_pct: self.sim.line_loss_frac(p.x, p.y) * 100.0 });
+            }
         }
         serde_wasm_bindgen::to_value(&v).map_err(|e| JsValue::from_str(&e.to_string()))
     }
