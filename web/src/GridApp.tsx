@@ -3,6 +3,9 @@ import { useGrid } from "./useGrid";
 import { LayerNav } from "./components/grid/LayerNav";
 import { SpiralPanel } from "./components/grid/SpiralPanel";
 import { NodeInspector } from "./components/grid/NodeInspector";
+import { NodeChart } from "./components/grid/NodeChart";
+
+const SPEEDS = [0.5, 1, 2, 4];
 
 const SEED = 1234;
 const N_DISTRICTS = 3;
@@ -28,9 +31,22 @@ export function GridApp() {
     <div className="grid-app">
       <div className="grid-toolbar">
         <LayerNav nodes={grid.nodes} selectedId={selectedId} onSelect={setSelectedId} />
-        <button onClick={grid.togglePause}>
-          {grid.paused ? "▶︎ Reprendre" : "⏸ Pause"}
-        </button>
+        <div className="grid-controls">
+          <div className="speed-group">
+            {SPEEDS.map((s) => (
+              <button
+                key={s}
+                className={grid.speed === s ? "active" : ""}
+                onClick={() => grid.setSpeed(s)}
+              >
+                {s}×
+              </button>
+            ))}
+          </div>
+          <button onClick={grid.togglePause}>
+            {grid.paused ? "▶︎ Reprendre" : "⏸ Pause"}
+          </button>
+        </div>
       </div>
 
       <div className="grid-main">
@@ -55,6 +71,10 @@ export function GridApp() {
             onBuildWind={grid.buildWind}
             onBuildBattery={grid.buildBattery}
           />
+        )}
+
+        {node && grid.history.length > 1 && (
+          <NodeChart history={grid.history} nodeId={selectedId} />
         )}
       </div>
     </div>

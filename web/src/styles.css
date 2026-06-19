@@ -688,3 +688,46 @@ button:disabled {
   background: rgba(220, 120, 40, 0.18);
   color: #f0a868;
 }
+
+/* Phase 5 : contrôles de vitesse, flux P2P, graphe par nœud */
+.grid-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.speed-group {
+  display: flex;
+  gap: 2px;
+}
+.speed-group button {
+  background: var(--bg);
+  color: var(--muted);
+  border: 1px solid var(--border);
+  padding: 5px 9px;
+  cursor: pointer;
+}
+.speed-group button:first-child { border-radius: 8px 0 0 8px; }
+.speed-group button:last-child { border-radius: 0 8px 8px 0; }
+.speed-group button.active {
+  color: var(--text);
+  border-color: var(--accent);
+  background: rgba(58, 166, 166, 0.15);
+}
+
+.p2p-panel {
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+  margin-top: 12px;
+}
+.p2p-panel h4 { margin: 0 0 6px; }
+
+.grid-main .chart-card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 16px;
+}
+.grid-main .chart-card h2 {
+  margin: 0 0 8px;
+  font-size: 16px;
+}

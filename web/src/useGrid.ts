@@ -2,18 +2,24 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { createGridGame, initEngine, type GridGame } from "./engine";
 import type { GridNodeView, GridSummary, NodeReport } from "./gridTypes";
 
-const DT_H = 0.5; // chaque tick avance le réseau de 30 min
+const DT_H = 0.5; // un tick à vitesse 1× avance le réseau de 30 min
 const TICK_MS = 250; // 4 ticks/seconde
+const HISTORY = 240; // ~5 jours simulés glissants (à 0.5 h/tick)
 
 export interface GridApi {
   ready: boolean;
   /** Rapports du dernier pas, indexés par NodeId (== indice). */
   reports: NodeReport[];
+  /** Historique glissant : un tableau de rapports (par nœud) par pas. */
+  history: NodeReport[][];
   /** Vues de tous les nœuds (arbre), rafraîchies après chaque action. */
   nodes: GridNodeView[];
   summary: GridSummary | null;
   root: number;
   paused: boolean;
+  /** Multiplicateur de vitesse (0.5, 1, 2, 4). */
+  speed: number;
+  setSpeed: (s: number) => void;
   togglePause: () => void;
   /** Règle le tarif national (prix import/export des quartiers). */
   setNationalTariff: (importPrice: number, exportPrice: number) => void;
@@ -33,10 +39,15 @@ export function useGrid(
   const gameRef = useRef<GridGame | null>(null);
   const [ready, setReady] = useState(false);
   const [reports, setReports] = useState<NodeReport[]>([]);
+  const [history, setHistory] = useState<NodeReport[][]>([]);
   const [nodes, setNodes] = useState<GridNodeView[]>([]);
   const [summary, setSummary] = useState<GridSummary | null>(null);
   const [root, setRoot] = useState(0);
   const [paused, setPaused] = useState(false);
+  const [speed, setSpeed] = useState(1);
+  // Ref miroir de la vitesse : la boucle lit la valeur courante sans se relancer.
+  const speedRef = useRef(1);
+  speedRef.current = speed;
 
   // Rafraîchit l'arbre des nœuds (après une action joueur ou un investissement).
   const refreshNodes = useCallback(() => {
@@ -66,8 +77,13 @@ export function useGrid(
     const handle = setInterval(() => {
       const g = gameRef.current;
       if (!g) return;
-      const r = g.tick(DT_H) as NodeReport[];
+      const r = g.tick(DT_H * speedRef.current) as NodeReport[];
       setReports(r);
+      setHistory((h) => {
+        const next = h.length >= HISTORY ? h.slice(1) : h.slice();
+        next.push(r);
+        return next;
+      });
       setSummary(g.summary() as GridSummary | null);
       // Les portefeuilles et l'auto-prod NPC évoluent : rafraîchit l'arbre.
       setNodes(g.nodes() as GridNodeView[]);
@@ -121,10 +137,13 @@ export function useGrid(
   return {
     ready,
     reports,
+    history,
     nodes,
     summary,
     root,
     paused,
+    speed,
+    setSpeed,
     togglePause,
     setNationalTariff,
     islandNode,

@@ -98,6 +98,11 @@ export function NodeInspector({
         </div>
       )}
 
+      {/* Flux P2P du quartier : énergie troquée localement entre voisins. */}
+      {isDistrict && children.length > 0 && (
+        <P2pPanel children={children} childReports={childReports} />
+      )}
+
       {/* Enfants : drill-down */}
       {children.length > 0 && (
         <div className="ni-children">
@@ -112,7 +117,10 @@ export function NodeInspector({
                   <span className="cc-name">
                     {TIER_EMOJI[c.tier]} {c.name}
                   </span>
-                  <span className="cc-line">{c.load_kw.toFixed(1)} kW charge</span>
+                  <span className="cc-line">
+                    {c.load_kw.toFixed(1)} kW
+                    {r && r.p2p_kw > 0.01 ? ` · 🔁 ${r.p2p_kw.toFixed(1)} P2P` : ""}
+                  </span>
                   <span className="cc-flags">
                     {c.islanded && <span className="badge islanded">⛔</span>}
                     {r?.blackout && <span className="badge blackout-alert">⚠️</span>}
@@ -125,6 +133,49 @@ export function NodeInspector({
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+/** Panneau des flux P2P d'un quartier : énergie totale troquée entre voisins et
+ * répartition donneurs (surplus de prod) / receveurs. Chaque transfert étant
+ * compté des deux côtés, le volume net du quartier est la demi-somme. */
+function P2pPanel({
+  children,
+  childReports,
+}: {
+  children: GridNodeView[];
+  childReports: NodeReport[];
+}) {
+  let total = 0;
+  let givers = 0;
+  let receivers = 0;
+  for (const c of children) {
+    const r = childReports[c.id];
+    if (!r) continue;
+    total += r.p2p_kw;
+    if (r.p2p_kw > 0.01) {
+      // Donneur si sa prod locale dépasse sa charge, receveur sinon.
+      if (r.solar_kw + r.wind_kw > r.load_kw) givers += 1;
+      else receivers += 1;
+    }
+  }
+  const net = total / 2;
+  if (net <= 0.01) {
+    return (
+      <div className="p2p-panel">
+        <h4>🔁 Micro-réseau (P2P)</h4>
+        <p className="muted">Aucun échange entre voisins sur ce pas.</p>
+      </div>
+    );
+  }
+  return (
+    <div className="p2p-panel">
+      <h4>🔁 Micro-réseau (P2P)</h4>
+      <p>
+        <strong>{net.toFixed(1)} kW</strong> troqués localement ·{" "}
+        ☀️ {givers} donneur(s) → 🏠 {receivers} receveur(s)
+      </p>
     </div>
   );
 }
