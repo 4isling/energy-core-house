@@ -26,6 +26,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::physics::{FuelKind, ThermalPlant};
 use crate::sim::Park;
 use crate::weather::{Rng, Weather};
 
@@ -244,6 +245,43 @@ impl Grid {
         let mut root = GridNode::new(0, Tier::National, name);
         root.wallet = Wallet::new(starting_balance_eur);
         Self { nodes: vec![root], root: 0, tick_count: 0, sim_hours: 0.0, last_invest_day: 0 }
+    }
+
+    /// **Scénario de départ jouable** : 1 national → `n_districts` quartiers →
+    /// `houses_per_district` maisons. Déterministe (seedé) : portefeuilles,
+    /// revenus, charges et préférences d'autonomie des foyers varient légèrement
+    /// d'une maison à l'autre. Le national a de grosses centrales pilotables et
+    /// de lourds coûts fixes — terreau de la spirale.
+    pub fn scenario(seed: u64, n_districts: usize, houses_per_district: usize) -> Self {
+        let mut rng = Rng::new(seed.max(1));
+        let mut g = Grid::new_national("Réseau national", 5_000_000.0);
+        {
+            let nat = g.node_mut(0);
+            nat.wallet.fixed_cost_eur_per_day = 20_000.0;
+            nat.park.add_thermal(ThermalPlant::new(FuelKind::GasCcgt, 200_000.0));
+        }
+        // Tarif national initial (modifiable par le joueur via set_national_tariff).
+        let import0 = 0.20;
+        let export0 = 0.10;
+        for d in 0..n_districts {
+            let dlink = Link::new(5_000.0, 0.04, import0, export0);
+            let did = g.add_child(0, Tier::District, format!("Quartier {}", d + 1), dlink);
+            {
+                let dn = g.node_mut(did);
+                dn.wallet = Wallet::new(100_000.0);
+                dn.wallet.fixed_cost_eur_per_day = 800.0;
+            }
+            for h in 0..houses_per_district {
+                let hlink = Link::new(30.0, 0.06, import0, export0);
+                let hid = g.add_child(did, Tier::Household, format!("Maison {}-{}", d + 1, h + 1), hlink);
+                let node = g.node_mut(hid);
+                node.wallet = Wallet::new(8_000.0 + rng.next_f64() * 4_000.0);
+                node.income_eur_per_day = 70.0 + rng.next_f64() * 60.0;
+                node.load_kw = 2.0 + rng.next_f64() * 2.0;
+                node.autonomy_pref = rng.next_f64() * 0.6;
+            }
+        }
+        g
     }
 
     /// Ajoute un enfant sous `parent`, raccordé par `link`. Renvoie son `NodeId`.
@@ -930,6 +968,22 @@ mod tests {
         assert!(high.dependency_rate < 0.2, "les foyers autoproduisent l'essentiel ({})", high.dependency_rate);
         // Le revenu que le national tire des imports s'effondre après décrochage.
         assert!(high.national_margin_eur < margin_before_high, "la marge nationale chute après décrochage ({} < {})", high.national_margin_eur, margin_before_high);
+    }
+
+    #[test]
+    fn scenario_builds_and_ticks_deterministically() {
+        let mut a = Grid::scenario(2024, 2, 3);
+        let mut b = Grid::scenario(2024, 2, 3);
+        // 1 national + 2 quartiers + 2*3 maisons = 9 nœuds.
+        assert_eq!(a.nodes.len(), 9);
+        assert_eq!(a.nodes.iter().filter(|n| n.tier == Tier::Household).count(), 6);
+        for _ in 0..50 {
+            let ra = a.tick(0.5);
+            let rb = b.tick(0.5);
+            for (x, y) in ra.iter().zip(rb.iter()) {
+                assert_eq!(x.balance_eur.to_bits(), y.balance_eur.to_bits());
+            }
+        }
     }
 
     #[test]
