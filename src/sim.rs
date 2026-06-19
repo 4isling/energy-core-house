@@ -297,7 +297,8 @@ impl SimState {
     /// vient de la tuile : `débit = météo × water_factor`).
     pub fn build_hydro_at(&mut self, x: u16, y: u16) -> Result<(), BuildError> {
         use crate::physics::HydroKind;
-        let h = HydroTurbine::new(HydroKind::Kaplan, 5.0, 10.0);
+        // Micro-hydro de village (~27 kW) : reste abordable à l'échelle colonie.
+        let h = HydroTurbine::new(HydroKind::Kaplan, 1.0, 3.0);
         let c = capex_hydro(&h);
         if self.economy.budget_eur < c {
             return Err(BuildError::Budget);

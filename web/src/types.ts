@@ -3,9 +3,42 @@ export interface BuildingReport {
   id: number;
   name: string;
   kind: string;
+  x: number;
+  y: number;
   load_kw: number;
   avg_comfort_pct: number;
   resident_count: number;
+}
+
+// Un élément posé sur la carte — reflète `PlacementView` (src/wasm.rs).
+export interface PlacementView {
+  kind: "wind" | "solar" | "hydro" | "genset" | "battery" | "building";
+  x: number;
+  y: number;
+}
+
+// Infos d'une tuile — reflète `TileInfoView` (src/wasm.rs).
+export interface TileInfo {
+  x: number;
+  y: number;
+  ground: string;
+  elevation: number;
+  wind_factor: number;
+  solar_factor: number;
+  water_factor: number;
+  buildable: boolean;
+  is_water: boolean;
+  occupied: boolean;
+}
+
+// Données de terrain chargées une seule fois pour le rendu.
+export interface TerrainData {
+  width: number;
+  height: number;
+  ground: Uint8Array; // 0=Eau 1=Plaine 2=Forêt 3=Colline 4=Montagne
+  wind: Uint8Array; // facteur vent (0..255 = 0..2.0)
+  solar: Uint8Array; // facteur soleil (0..255 = 0..1.0)
+  water: Uint8Array; // facteur débit (0..255 = 0..4.0)
 }
 
 // Reflète `TickReport` (src/sim.rs) renvoyé par `Game.tick()`.
@@ -54,6 +87,8 @@ export interface BuildingView {
   id: number;
   kind: string; // "Studio" | "Family" | "Elders" (variante serde)
   name: string;
+  x: number;
+  y: number;
   appliances: ApplianceView[];
   residents: ResidentView[];
   load_kw: number;
@@ -89,4 +124,30 @@ export const BUILDING_CATALOG: {
   { code: "studio", label: "Studio", emoji: "🏠", cost: 8_000, detail: "1 actif" },
   { code: "family", label: "Foyer familial", emoji: "🏡", cost: 14_000, detail: "actif + ado" },
   { code: "elders", label: "Logement séniors", emoji: "🏘️", cost: 11_000, detail: "2 retraités" },
+];
+
+// Outils plaçables sur la carte (palette de construction). `icon` est un fichier
+// sprite dans `web/public/sprites/` (placeholders pixel-art) ; `emoji` est le
+// repli si le sprite est absent. Les coûts reflètent les CAPEX du cœur Rust.
+export interface BuildTool {
+  id: string;
+  label: string;
+  icon: string; // nom de fichier sprite
+  emoji: string;
+  cost: number;
+  terrain: "land" | "water";
+  category: "energy" | "building";
+  detail: string;
+  buildingCode?: string; // si category === "building"
+}
+
+export const BUILD_TOOLS: BuildTool[] = [
+  { id: "solar", label: "Panneau solaire", icon: "solar.png", emoji: "☀️", cost: 6_600, terrain: "land", category: "energy", detail: "6 kWc — mieux au soleil" },
+  { id: "wind", label: "Micro-éolienne", icon: "wind.png", emoji: "🌬️", cost: 9_250, terrain: "land", category: "energy", detail: "~5 kW — mieux sur les crêtes" },
+  { id: "hydro", label: "Micro-hydro", icon: "hydro.png", emoji: "💧", cost: 108_000, terrain: "water", category: "energy", detail: "~27 kW — sur rivière" },
+  { id: "genset", label: "Groupe électrogène", icon: "genset.png", emoji: "🛢️", cost: 5_400, terrain: "land", category: "energy", detail: "~6 kW — secours fossile" },
+  { id: "battery", label: "Batterie", icon: "battery.png", emoji: "🔋", cost: 6_000, terrain: "land", category: "energy", detail: "10 kWh — stockage" },
+  { id: "studio", label: "Studio", icon: "house.png", emoji: "🏠", cost: 8_000, terrain: "land", category: "building", detail: "1 actif", buildingCode: "studio" },
+  { id: "family", label: "Foyer familial", icon: "house.png", emoji: "🏡", cost: 14_000, terrain: "land", category: "building", detail: "actif + ado", buildingCode: "family" },
+  { id: "elders", label: "Logement séniors", icon: "house.png", emoji: "🏘️", cost: 11_000, terrain: "land", category: "building", detail: "2 retraités", buildingCode: "elders" },
 ];

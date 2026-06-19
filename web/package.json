@@ -4,13 +4,15 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "wasm": "wasm-pack build .. --target web --features wasm --out-dir web/src/pkg",
+    "wasm": "cargo build --manifest-path ../Cargo.toml --target wasm32-unknown-unknown --release --features wasm && wasm-bindgen ../target/wasm32-unknown-unknown/release/energy_core.wasm --out-dir src/pkg --target web",
     "wasm:manual": "cargo build --manifest-path ../Cargo.toml --target wasm32-unknown-unknown --release --features wasm && wasm-bindgen ../target/wasm32-unknown-unknown/release/energy_core.wasm --out-dir src/pkg --target web",
+    "wasm:pack": "wasm-pack build .. --target web --features wasm --out-dir web/src/pkg",
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview"
   },
   "dependencies": {
+    "pixi.js": "^8.6.6",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "recharts": "^2.13.3"

@@ -2,93 +2,89 @@ import { useState } from "react";
 import type { GameApi } from "../useGame";
 import {
   APPLIANCE_CATALOG,
-  BUILDING_CATALOG,
+  BUILD_TOOLS,
   RESIDENT_PROFILES,
+  type BuildTool,
   type BuildingView,
 } from "../types";
 
-// CAPEX (cf. src/economy.rs) pour griser les boutons si budget insuffisant.
-const SOLAR_KWC = 6;
-const BATTERY_KWH = 10;
-const COST = {
-  solar: SOLAR_KWC * 1100, // 1100 €/kWc
-  windMicro: 5 * 1850, // 1850 €/kW, micro = 5 kW
-  battery: BATTERY_KWH * 600, // 600 €/kWh
-  genset: 6 * 900, // 900 €/kW, genset = 6 kW
-};
-
+// Palette de construction (sélection d'un outil) + gestion des foyers.
+// La pose se fait ensuite en cliquant une tuile de la carte.
 export function BuildMenu({
   game,
   budget,
+  selectedTool,
+  onSelectTool,
 }: {
   game: GameApi;
   budget: number;
+  selectedTool: BuildTool | null;
+  onSelectTool: (t: BuildTool | null) => void;
 }) {
   const { buildings } = game;
   const [selected, setSelected] = useState<number | null>(null);
+  const current = buildings.find((b) => b.id === selected) ?? buildings[0] ?? null;
 
-  // Sélection courante de foyer (par défaut le premier).
-  const current =
-    buildings.find((b) => b.id === selected) ?? buildings[0] ?? null;
+  const energy = BUILD_TOOLS.filter((t) => t.category === "energy");
+  const homes = BUILD_TOOLS.filter((t) => t.category === "building");
 
   return (
     <aside className="build-menu">
       <section>
-        <h2>Micro-réseau partagé</h2>
-        <BuildBtn
-          label={`☀️ Solaire ${SOLAR_KWC} kWc`}
-          cost={COST.solar}
-          budget={budget}
-          onClick={() => game.buildSolar(SOLAR_KWC)}
-        />
-        <BuildBtn
-          label="🌬️ Micro-éolien 5 kW"
-          cost={COST.windMicro}
-          budget={budget}
-          onClick={game.buildWindMicro}
-        />
-        <BuildBtn
-          label={`🔋 Batterie ${BATTERY_KWH} kWh`}
-          cost={COST.battery}
-          budget={budget}
-          onClick={() => game.buildBattery(BATTERY_KWH)}
-        />
-        <BuildBtn
-          label="⛽ Groupe électrogène 6 kW"
-          cost={COST.genset}
-          budget={budget}
-          onClick={game.buildGenset}
-        />
-      </section>
-
-      <section>
-        <h2>Construire un foyer</h2>
-        {BUILDING_CATALOG.map((b) => (
-          <BuildBtn
-            key={b.code}
-            label={`${b.emoji} ${b.label}`}
-            sub={b.detail}
-            cost={b.cost}
-            budget={budget}
-            onClick={() => game.buildBuilding(b.code)}
-          />
-        ))}
+        <h2>Construire</h2>
+        <p className="muted">
+          {selectedTool
+            ? `Cliquez une tuile pour poser : ${selectedTool.label}.`
+            : "Choisissez un élément, puis cliquez une tuile."}
+        </p>
+        <div className="palette">
+          {energy.map((t) => (
+            <ToolBtn key={t.id} tool={t} budget={budget} selected={selectedTool?.id === t.id} onSelect={onSelectTool} />
+          ))}
+        </div>
+        <h3>Foyers</h3>
+        <div className="palette">
+          {homes.map((t) => (
+            <ToolBtn key={t.id} tool={t} budget={budget} selected={selectedTool?.id === t.id} onSelect={onSelectTool} />
+          ))}
+        </div>
       </section>
 
       <section>
         <h2>Gérer un foyer</h2>
         {current ? (
-          <ManageBuilding
-            game={game}
-            buildings={buildings}
-            current={current}
-            onSelect={setSelected}
-          />
+          <ManageBuilding game={game} buildings={buildings} current={current} onSelect={setSelected} />
         ) : (
           <p className="muted">Construisez un foyer pour le gérer.</p>
         )}
       </section>
     </aside>
+  );
+}
+
+function ToolBtn({
+  tool,
+  budget,
+  selected,
+  onSelect,
+}: {
+  tool: BuildTool;
+  budget: number;
+  selected: boolean;
+  onSelect: (t: BuildTool | null) => void;
+}) {
+  const affordable = budget >= tool.cost;
+  return (
+    <button
+      className={`tool-btn${selected ? " selected" : ""}`}
+      disabled={!affordable}
+      title={tool.detail}
+      onClick={() => onSelect(selected ? null : tool)}
+    >
+      <span className="tool-emoji">{tool.emoji}</span>
+      <span className="tool-label">{tool.label}</span>
+      <span className="cost">{tool.cost.toLocaleString("fr-FR")} €</span>
+    </button>
   );
 }
 
@@ -123,10 +119,7 @@ function ManageBuilding({
       <h3>Appareils</h3>
       <div className="catalog">
         {APPLIANCE_CATALOG.map((a) => (
-          <button
-            key={a.code}
-            onClick={() => game.addApplianceTo(current.id, a.code)}
-          >
+          <button key={a.code} onClick={() => game.addApplianceTo(current.id, a.code)}>
             + {a.label}
             <span className="power">{a.power_kw} kW</span>
           </button>
@@ -157,9 +150,7 @@ function ManageBuilding({
             </option>
           ))}
         </select>
-        <button onClick={() => game.addResidentTo(current.id, name, profile)}>
-          + Ajouter
-        </button>
+        <button onClick={() => game.addResidentTo(current.id, name, profile)}>+ Ajouter</button>
       </div>
       <ul className="resident-list">
         {current.residents.map((r, i) => (
@@ -169,30 +160,5 @@ function ManageBuilding({
         ))}
       </ul>
     </>
-  );
-}
-
-function BuildBtn({
-  label,
-  sub,
-  cost,
-  budget,
-  onClick,
-}: {
-  label: string;
-  sub?: string;
-  cost: number;
-  budget: number;
-  onClick: () => void;
-}) {
-  const affordable = budget >= cost;
-  return (
-    <button className="build-btn" disabled={!affordable} onClick={onClick}>
-      <span>
-        {label}
-        {sub && <span className="build-sub"> · {sub}</span>}
-      </span>
-      <span className="cost">{cost.toLocaleString("fr-FR")} €</span>
-    </button>
   );
 }
