@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use crate::appliance::ApplianceKind;
 use crate::building::{Building, BuildingKind, BuildingReport};
 use crate::economy::{
-    self, capex_battery_per_kwh, capex_building, capex_hydro, capex_solar, capex_thermal,
-    capex_wind, opex_hydro_year, opex_solar_year, opex_thermal_year, opex_wind_year, Economy,
+    capex_battery_per_kwh, capex_building, capex_hydro, capex_solar, capex_thermal, capex_wind,
+    opex_hydro_year, opex_solar_year, opex_thermal_year, opex_wind_year, Economy,
 };
 use crate::map::{TerrainMap, TerrainTile};
 use crate::physics::{HydroTurbine, SolarArray, ThermalPlant, WindTurbine};
@@ -120,6 +120,124 @@ impl Park {
         for t in &self.thermal { o += opex_thermal_year(&t.asset); }
         o
     }
+
+    /// **Dispatch local** du parc, *pur* (aucune dépendance à l'économie ni au
+    /// réseau) : il produit le renouvelable, applique la batterie mutualisée puis
+    /// les centrales pilotables, et renvoie le **résidu signé** (cf.
+    /// [`ParkDispatch`]). C'est le cœur partagé entre le jeu mono-carte
+    /// (`SimState::tick`) et le réseau multi-couches (`grid.rs`) : un seul et
+    /// même équilibrage local, deux échelles.
+    ///
+    /// - `load_kw` : la charge à couvrir sur ce pas.
+    /// - `line_loss` : pertes en ligne (0..1) d'un actif posé en `(x, y)` vers le
+    ///   point de charge. Renvoie `0.0` pour un parc non spatial (env neutre).
+    /// - La fonction **ne touche ni au budget ni au CO₂ cumulés** : elle se
+    ///   contente de *rapporter* `fuel_cost_eur` et `co2_kg` ; l'appelant décide
+    ///   quoi en faire (les imputer à un `Wallet`, à l'`Economy`, etc.).
+    pub fn dispatch(
+        &mut self,
+        load_kw: f64,
+        weather: &Weather,
+        dt_h: f64,
+        line_loss: impl Fn(u16, u16) -> f64,
+    ) -> ParkDispatch {
+        let mut d = ParkDispatch::default();
+
+        // 1. Production renouvelable : puissance brute produite par filière, et
+        //    puissance livrée (après pertes en ligne) qui alimente réellement la
+        //    charge locale.
+        let mut renewable_kw = 0.0;
+        for p in &self.wind {
+            let gen = p.asset.power_kw(weather.wind_ms * p.env.wind_factor);
+            let delivered = gen * (1.0 - line_loss(p.x, p.y));
+            d.wind_kw += gen;
+            renewable_kw += delivered;
+            d.loss_kwh += (gen - delivered) * dt_h;
+        }
+        for p in &self.solar {
+            let gen = p.asset.power_kw(weather.irradiance_kw_m2 * p.env.solar_factor, weather.air_temp_c);
+            let delivered = gen * (1.0 - line_loss(p.x, p.y));
+            d.solar_kw += gen;
+            renewable_kw += delivered;
+            d.loss_kwh += (gen - delivered) * dt_h;
+        }
+        for p in &self.hydro {
+            let gen = p.asset.power_kw(weather.river_flow_m3s * p.env.water_factor);
+            let delivered = gen * (1.0 - line_loss(p.x, p.y));
+            d.hydro_kw += gen;
+            renewable_kw += delivered;
+            d.loss_kwh += (gen - delivered) * dt_h;
+        }
+
+        let net_kwh = (renewable_kw - load_kw) * dt_h;
+
+        if net_kwh >= 0.0 {
+            // Surplus : batterie d'abord, le reste devient un résidu positif.
+            let mut surplus = net_kwh;
+            if let Some(b) = &mut self.battery {
+                let charged = b.charge(surplus, dt_h);
+                d.battery_kwh -= charged;
+                surplus -= charged;
+            }
+            d.residual_kwh = surplus;
+        } else {
+            // Déficit : batterie puis centrales pilotables ; le reste est un
+            // résidu négatif (à couvrir par le réseau/parent, sinon black-out).
+            let mut deficit = -net_kwh;
+
+            if let Some(b) = &mut self.battery {
+                let dis = b.discharge(deficit, dt_h);
+                d.battery_kwh += dis;
+                deficit -= dis;
+            }
+
+            for plant in &self.thermal {
+                if deficit <= EPS { break; }
+                let loss = line_loss(plant.x, plant.y);
+                let asset = &plant.asset;
+                // Énergie livrable au point de charge après pertes ; on couvre le
+                // déficit avec la part livrée, mais on brûle (et émet pour) la
+                // part produite.
+                let deliverable = asset.max_energy_kwh(dt_h) * (1.0 - loss);
+                let delivered = deliverable.min(deficit);
+                if delivered <= 0.0 { continue; }
+                let gen = delivered / (1.0 - loss);
+                deficit -= delivered;
+                d.thermal_kwh += gen;
+                d.loss_kwh += gen - delivered;
+                d.fuel_cost_eur += gen * asset.fuel_cost_eur_per_kwh();
+                d.co2_kg += Economy::co2_of_fuel(asset.kind, gen);
+            }
+
+            d.residual_kwh = -deficit;
+        }
+
+        d
+    }
+}
+
+/// Résultat du [`Park::dispatch`] sur un pas de temps. Toutes les énergies sont
+/// en kWh sur le pas ; le **résidu** est signé : `+` = surplus restant après
+/// batterie, `−` = déficit restant après batterie + centrales. C'est lui qui
+/// monte vers le réseau (import/export en mono-carte, `uplink` en multi-couches).
+#[derive(Clone, Debug, Default)]
+pub struct ParkDispatch {
+    /// Puissance éolienne **brute** produite (kW), avant pertes en ligne.
+    pub wind_kw: f64,
+    pub solar_kw: f64,
+    pub hydro_kw: f64,
+    /// Énergie thermique brute produite (kWh) par les centrales pilotables.
+    pub thermal_kwh: f64,
+    /// Énergie batterie (kWh) : positive en décharge, négative en charge.
+    pub battery_kwh: f64,
+    /// Énergie dissipée dans les lignes (kWh) sur le pas.
+    pub loss_kwh: f64,
+    /// Résidu signé (kWh) : `+` surplus, `−` déficit, après moyens locaux.
+    pub residual_kwh: f64,
+    /// CO₂ émis par les centrales pilotables (kg) — **non** cumulé par le parc.
+    pub co2_kg: f64,
+    /// Coût du combustible brûlé (€) — **non** débité par le parc.
+    pub fuel_cost_eur: f64,
 }
 
 /// Bilan d'un pas de temps : tout ce dont l'UI a besoin pour une frame.
@@ -622,89 +740,54 @@ impl SimState {
             load_kw += b.load_kw();
         }
 
-        // 1. Production renouvelable instantanée (kW), mutualisée sur le réseau.
-        //    Chaque actif utilise la météo **modulée par sa tuile** (terrain) :
-        //    crête ventée, versant ombragé, gros débit de rivière, etc.
-        //    La puissance **produite** (rapportée à l'UI) traverse ensuite une
-        //    ligne vers le hub : seule la part **livrée** (après pertes) alimente
-        //    le réseau. `loss_kwh` cumule l'énergie dissipée dans les lignes.
-        let mut loss_kwh = 0.0;
-        let mut wind_kw = 0.0;
-        let mut solar_kw = 0.0;
-        let mut hydro_kw = 0.0;
-        let mut renewable_kw = 0.0; // puissance livrée au hub (après pertes)
-        for p in &self.park.wind {
-            let gen = p.asset.power_kw(weather.wind_ms * p.env.wind_factor);
-            let delivered = gen * (1.0 - self.line_loss_frac(p.x, p.y));
-            wind_kw += gen;
-            renewable_kw += delivered;
-            loss_kwh += (gen - delivered) * dt_h;
-        }
-        for p in &self.park.solar {
-            let gen = p.asset.power_kw(weather.irradiance_kw_m2 * p.env.solar_factor, weather.air_temp_c);
-            let delivered = gen * (1.0 - self.line_loss_frac(p.x, p.y));
-            solar_kw += gen;
-            renewable_kw += delivered;
-            loss_kwh += (gen - delivered) * dt_h;
-        }
-        for p in &self.park.hydro {
-            let gen = p.asset.power_kw(weather.river_flow_m3s * p.env.water_factor);
-            let delivered = gen * (1.0 - self.line_loss_frac(p.x, p.y));
-            hydro_kw += gen;
-            renewable_kw += delivered;
-            loss_kwh += (gen - delivered) * dt_h;
-        }
+        // 1. Équilibrage local du parc, délégué à `Park::dispatch` (production
+        //    renouvelable modulée par le terrain, batterie, centrales pilotables).
+        //    Chaque actif utilise la météo **modulée par sa tuile** ; la part
+        //    livrée (après pertes en ligne vers le hub) alimente la charge.
+        //    `dispatch` est *pur* : il rapporte combustible/CO₂ sans débiter le
+        //    budget — on impute ici, comme avant.
+        //    On précalcule le hub pour une closure de pertes qui n'emprunte pas
+        //    `self` (sinon conflit avec l'emprunt mutable de `self.park`).
+        let hub = self.distribution_hub();
+        let loss_fn = |x: u16, y: u16| -> f64 {
+            match hub {
+                Some((hx, hy)) => {
+                    let dx = x as f64 - hx;
+                    let dy = y as f64 - hy;
+                    let dist = (dx * dx + dy * dy).sqrt();
+                    (dist * LOSS_PER_TILE).clamp(0.0, LOSS_MAX)
+                }
+                None => 0.0,
+            }
+        };
+        let disp = self.park.dispatch(load_kw, weather, dt_h, loss_fn);
 
-        let net_kwh = (renewable_kw - load_kw) * dt_h;
+        let wind_kw = disp.wind_kw;
+        let solar_kw = disp.solar_kw;
+        let hydro_kw = disp.hydro_kw;
+        let thermal_kwh = disp.thermal_kwh;
+        let battery_kwh = disp.battery_kwh;
+        let loss_kwh = disp.loss_kwh;
 
-        let mut thermal_kwh = 0.0;
-        let mut battery_kwh = 0.0; // + décharge, - charge
+        // Imputation économique du dispatch (combustible + CO₂ des centrales).
+        self.economy.budget_eur -= disp.fuel_cost_eur;
+        self.economy.co2_kg += disp.co2_kg;
+        let mut co2_step = disp.co2_kg;
+
+        // 1b. Échange avec le réseau : le résidu signé devient export (surplus) ou
+        //     import/non-fourni (déficit), selon le raccordement.
         let mut import_kwh = 0.0;
         let mut export_kwh = 0.0;
         let mut unmet_kwh = 0.0;
-        let mut co2_step = 0.0;
 
-        if net_kwh >= 0.0 {
-            // Surplus -> batterie -> export/réseau.
-            let mut surplus = net_kwh;
-            if let Some(b) = &mut self.park.battery {
-                let charged = b.charge(surplus, dt_h);
-                battery_kwh -= charged;
-                surplus -= charged;
-            }
+        if disp.residual_kwh >= 0.0 {
+            let surplus = disp.residual_kwh;
             if surplus > 0.0 && self.economy.grid.connected {
                 export_kwh = surplus;
                 self.economy.budget_eur += self.economy.export_revenue(surplus);
             }
         } else {
-            // Déficit -> batterie -> thermique -> import réseau -> non-fourni.
-            let mut deficit = -net_kwh;
-
-            if let Some(b) = &mut self.park.battery {
-                let d = b.discharge(deficit, dt_h);
-                battery_kwh += d;
-                deficit -= d;
-            }
-
-            for plant in &self.park.thermal {
-                if deficit <= EPS { break; }
-                let loss = self.line_loss_frac(plant.x, plant.y);
-                let asset = &plant.asset;
-                // Énergie livrable au hub après pertes ; on couvre le déficit avec
-                // la part livrée, mais on brûle (et émet pour) la part produite.
-                let deliverable = asset.max_energy_kwh(dt_h) * (1.0 - loss);
-                let delivered = deliverable.min(deficit);
-                if delivered <= 0.0 { continue; }
-                let gen = delivered / (1.0 - loss);
-                deficit -= delivered;
-                thermal_kwh += gen;
-                loss_kwh += gen - delivered;
-                self.economy.budget_eur -= gen * asset.fuel_cost_eur_per_kwh();
-                let c = economy::Economy::co2_of_fuel(asset.kind, gen);
-                self.economy.co2_kg += c;
-                co2_step += c;
-            }
-
+            let mut deficit = -disp.residual_kwh;
             if deficit > EPS && self.economy.grid.connected {
                 import_kwh = deficit;
                 self.economy.budget_eur -= self.economy.import_cost(deficit);
@@ -713,7 +796,6 @@ impl SimState {
                 co2_step += c;
                 deficit = 0.0;
             }
-
             unmet_kwh = deficit.max(0.0);
         }
 
