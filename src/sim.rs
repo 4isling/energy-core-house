@@ -10,6 +10,7 @@ use crate::economy::{
     self, capex_battery_per_kwh, capex_building, capex_hydro, capex_solar, capex_thermal,
     capex_wind, opex_hydro_year, opex_solar_year, opex_thermal_year, opex_wind_year, Economy,
 };
+use crate::map::{TerrainMap, TerrainTile};
 use crate::physics::{HydroTurbine, SolarArray, ThermalPlant, WindTurbine};
 use crate::resident::ResidentProfile;
 use crate::storage::Battery;
@@ -18,25 +19,83 @@ use crate::weather::Weather;
 const HOURS_PER_YEAR: f64 = 8760.0;
 const EPS: f64 = 1e-6;
 
+/// Facteurs de terrain capturés à la pose d'un actif : ils **modulent** les
+/// entrées de la physique (`physics.rs`) sans changer aucune formule
+/// (`vent_local = météo.vent × wind_factor`, idem soleil et débit d'eau). Un
+/// environnement *neutre* (tout à 1.0) reproduit le comportement hors-carte.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct TileEnv {
+    pub wind_factor: f64,
+    pub solar_factor: f64,
+    pub water_factor: f64,
+}
+
+impl TileEnv {
+    /// Environnement neutre : la production utilise la météo brute.
+    pub const NEUTRAL: TileEnv = TileEnv { wind_factor: 1.0, solar_factor: 1.0, water_factor: 1.0 };
+
+    pub fn from_tile(t: &TerrainTile) -> Self {
+        Self {
+            wind_factor: t.wind_factor as f64,
+            solar_factor: t.solar_factor as f64,
+            water_factor: t.water_factor as f64,
+        }
+    }
+}
+
+/// Un actif posé sur une tuile : coordonnées + environnement terrain capturé.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Placed<T> {
+    pub x: u16,
+    pub y: u16,
+    pub env: TileEnv,
+    pub asset: T,
+}
+
+impl<T> Placed<T> {
+    /// Pose hors-carte (env neutre), pour les constructeurs non spatiaux/tests.
+    fn off_map(asset: T) -> Self {
+        Self { x: 0, y: 0, env: TileEnv::NEUTRAL, asset }
+    }
+}
+
+/// Échec de construction sur la carte, pour un retour d'UI clair.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BuildError {
+    /// Budget insuffisant.
+    Budget,
+    /// Coordonnées hors de la carte (ou carte non générée).
+    OutOfBounds,
+    /// Tuile déjà occupée par un autre élément.
+    Occupied,
+    /// Le terrain interdit cet élément (ex. hydro hors rivière, bâti en montagne).
+    BadTerrain,
+}
+
 /// Le **micro-réseau partagé** du village : les actifs de production et de
 /// stockage construits par le joueur, mutualisés entre tous les bâtiments.
-/// La demande, elle, vit dans les `Building` (`building.rs`).
+/// Chaque actif est **placé** sur une tuile (cf. `Placed`). La demande, elle,
+/// vit dans les `Building` (`building.rs`).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Park {
-    pub wind: Vec<WindTurbine>,
-    pub solar: Vec<SolarArray>,
-    pub hydro: Vec<HydroTurbine>,
-    pub thermal: Vec<ThermalPlant>,
+    pub wind: Vec<Placed<WindTurbine>>,
+    pub solar: Vec<Placed<SolarArray>>,
+    pub hydro: Vec<Placed<HydroTurbine>>,
+    pub thermal: Vec<Placed<ThermalPlant>>,
+    /// Capacité batterie agrégée (le dispatch traite un seul stock mutualisé).
     pub battery: Option<Battery>,
+    /// Tuiles où des batteries ont été posées (pour le rendu ; la capacité est
+    /// agrégée dans `battery`).
+    pub battery_tiles: Vec<(u16, u16)>,
 }
 
 impl Park {
     pub fn opex_year(&self) -> f64 {
         let mut o = 0.0;
-        for t in &self.wind { o += opex_wind_year(t); }
-        for s in &self.solar { o += opex_solar_year(s); }
-        for h in &self.hydro { o += opex_hydro_year(h); }
-        for t in &self.thermal { o += opex_thermal_year(t); }
+        for t in &self.wind { o += opex_wind_year(&t.asset); }
+        for s in &self.solar { o += opex_solar_year(&s.asset); }
+        for h in &self.hydro { o += opex_hydro_year(&h.asset); }
+        for t in &self.thermal { o += opex_thermal_year(&t.asset); }
         o
     }
 }
@@ -76,11 +135,17 @@ pub struct SimState {
     pub park: Park,
     /// Les bâtiments du village (foyers) : l'unité de demande du micro-réseau.
     pub buildings: Vec<Building>,
+    /// La carte de terrain. Vide (0×0) tant que `generate_map` n'a pas été appelé
+    /// (les constructeurs non spatiaux fonctionnent sans carte).
+    pub map: TerrainMap,
     pub economy: Economy,
     pub hour: f64,
     pub day: u32,
     /// Charge additionnelle globale (kW) — override manuel/tests, hors bâtiments.
     pub load_kw: f64,
+    /// Occupation des tuiles (parallèle à `map.tiles`) : empêche deux poses sur
+    /// la même tuile. Vide tant que la carte n'est pas générée.
+    occupied: Vec<bool>,
     /// Compteur d'identifiants de bâtiments.
     next_building_id: u32,
     /// Compteur d'identifiants d'appareils, unique sur tout le village.
@@ -92,13 +157,28 @@ impl SimState {
         Self {
             park: Park::default(),
             buildings: Vec::new(),
+            map: TerrainMap::default(),
             economy: Economy::new(starting_budget_eur),
             hour: 8.0,
             day: 1,
             load_kw: 0.0,
+            occupied: Vec::new(),
             next_building_id: 0,
             next_appliance_id: 0,
         }
+    }
+
+    /// Génère la carte de terrain depuis un seed (500×500 par défaut) et réinit
+    /// l'occupation. À appeler une fois au démarrage d'une partie spatiale.
+    pub fn generate_map(&mut self, seed: u64) {
+        self.map = TerrainMap::generate(seed);
+        self.occupied = vec![false; self.map.len()];
+    }
+
+    /// Variante de `generate_map` à taille choisie (tests / petites cartes).
+    pub fn generate_map_sized(&mut self, seed: u64, w: u16, h: u16) {
+        self.map = TerrainMap::generate_sized(seed, w, h);
+        self.occupied = vec![false; self.map.len()];
     }
 
     /// Peuple un village de départ (quelques foyers déjà habités) pour que la
@@ -114,28 +194,28 @@ impl SimState {
         let c = capex_wind(&t);
         if self.economy.budget_eur < c { return false; }
         self.economy.budget_eur -= c;
-        self.park.wind.push(t);
+        self.park.wind.push(Placed::off_map(t));
         true
     }
     pub fn build_solar(&mut self, s: SolarArray) -> bool {
         let c = capex_solar(&s);
         if self.economy.budget_eur < c { return false; }
         self.economy.budget_eur -= c;
-        self.park.solar.push(s);
+        self.park.solar.push(Placed::off_map(s));
         true
     }
     pub fn build_hydro(&mut self, h: HydroTurbine) -> bool {
         let c = capex_hydro(&h);
         if self.economy.budget_eur < c { return false; }
         self.economy.budget_eur -= c;
-        self.park.hydro.push(h);
+        self.park.hydro.push(Placed::off_map(h));
         true
     }
     pub fn build_thermal(&mut self, t: ThermalPlant) -> bool {
         let c = capex_thermal(&t);
         if self.economy.budget_eur < c { return false; }
         self.economy.budget_eur -= c;
-        self.park.thermal.push(t);
+        self.park.thermal.push(Placed::off_map(t));
         true
     }
     /// Ajoute de la capacité batterie (fusionne avec l'existante).
@@ -152,6 +232,137 @@ impl SimState {
             None => self.park.battery = Some(Battery::new(capacity_kwh)),
         }
         true
+    }
+
+    // --- Construction spatiale sur la carte (renvoie une `BuildError`) ---
+
+    /// Réserve une tuile **terrestre constructible** et renvoie l'environnement
+    /// terrain capturé. Ne touche ni au budget ni aux actifs.
+    fn claim_land_tile(&mut self, x: u16, y: u16) -> Result<TileEnv, BuildError> {
+        let tile = self.map.get(x, y).ok_or(BuildError::OutOfBounds)?;
+        if !tile.buildable() {
+            return Err(BuildError::BadTerrain);
+        }
+        let env = TileEnv::from_tile(tile);
+        let i = self.map.idx(x, y);
+        if self.occupied[i] {
+            return Err(BuildError::Occupied);
+        }
+        self.occupied[i] = true;
+        Ok(env)
+    }
+
+    /// Réserve une tuile **d'eau** (rivière) pour l'hydraulique.
+    fn claim_water_tile(&mut self, x: u16, y: u16) -> Result<TileEnv, BuildError> {
+        let tile = self.map.get(x, y).ok_or(BuildError::OutOfBounds)?;
+        if !tile.is_water() {
+            return Err(BuildError::BadTerrain);
+        }
+        let env = TileEnv::from_tile(tile);
+        let i = self.map.idx(x, y);
+        if self.occupied[i] {
+            return Err(BuildError::Occupied);
+        }
+        self.occupied[i] = true;
+        Ok(env)
+    }
+
+    /// Pose un champ solaire (kWc) sur une tuile constructible.
+    pub fn build_solar_at(&mut self, x: u16, y: u16, kwc: f64) -> Result<(), BuildError> {
+        let s = SolarArray::new(kwc);
+        let c = capex_solar(&s);
+        if self.economy.budget_eur < c {
+            return Err(BuildError::Budget);
+        }
+        let env = self.claim_land_tile(x, y)?;
+        self.economy.budget_eur -= c;
+        self.park.solar.push(Placed { x, y, env, asset: s });
+        Ok(())
+    }
+
+    /// Pose une micro-éolienne domestique sur une tuile constructible.
+    pub fn build_wind_at(&mut self, x: u16, y: u16) -> Result<(), BuildError> {
+        let t = WindTurbine::micro();
+        let c = capex_wind(&t);
+        if self.economy.budget_eur < c {
+            return Err(BuildError::Budget);
+        }
+        let env = self.claim_land_tile(x, y)?;
+        self.economy.budget_eur -= c;
+        self.park.wind.push(Placed { x, y, env, asset: t });
+        Ok(())
+    }
+
+    /// Pose une turbine hydraulique sur une tuile **de rivière** (le débit local
+    /// vient de la tuile : `débit = météo × water_factor`).
+    pub fn build_hydro_at(&mut self, x: u16, y: u16) -> Result<(), BuildError> {
+        use crate::physics::HydroKind;
+        let h = HydroTurbine::new(HydroKind::Kaplan, 5.0, 10.0);
+        let c = capex_hydro(&h);
+        if self.economy.budget_eur < c {
+            return Err(BuildError::Budget);
+        }
+        let env = self.claim_water_tile(x, y)?;
+        self.economy.budget_eur -= c;
+        self.park.hydro.push(Placed { x, y, env, asset: h });
+        Ok(())
+    }
+
+    /// Pose un groupe électrogène domestique sur une tuile constructible.
+    pub fn build_genset_at(&mut self, x: u16, y: u16) -> Result<(), BuildError> {
+        let t = ThermalPlant::genset();
+        let c = capex_thermal(&t);
+        if self.economy.budget_eur < c {
+            return Err(BuildError::Budget);
+        }
+        let env = self.claim_land_tile(x, y)?;
+        self.economy.budget_eur -= c;
+        self.park.thermal.push(Placed { x, y, env, asset: t });
+        Ok(())
+    }
+
+    /// Pose une batterie (kWh) sur une tuile constructible. La capacité est
+    /// agrégée au stock mutualisé ; la tuile sert au rendu.
+    pub fn build_battery_at(&mut self, x: u16, y: u16, capacity_kwh: f64) -> Result<(), BuildError> {
+        let c = capacity_kwh * capex_battery_per_kwh();
+        if self.economy.budget_eur < c {
+            return Err(BuildError::Budget);
+        }
+        // La batterie n'a pas besoin du terrain : env ignoré, mais la tuile doit
+        // être constructible et libre.
+        let _env = self.claim_land_tile(x, y)?;
+        self.economy.budget_eur -= c;
+        match &mut self.park.battery {
+            Some(b) => {
+                b.capacity_kwh += capacity_kwh;
+                b.max_charge_kw += capacity_kwh * 0.5;
+                b.max_discharge_kw += capacity_kwh * 0.5;
+            }
+            None => self.park.battery = Some(Battery::new(capacity_kwh)),
+        }
+        self.park.battery_tiles.push((x, y));
+        Ok(())
+    }
+
+    /// Construit un bâtiment sur une tuile constructible (débite le CAPEX).
+    /// Renvoie l'id du bâtiment.
+    pub fn build_building_at(
+        &mut self,
+        x: u16,
+        y: u16,
+        kind: BuildingKind,
+    ) -> Result<u32, BuildError> {
+        let c = capex_building(kind);
+        if self.economy.budget_eur < c {
+            return Err(BuildError::Budget);
+        }
+        let _env = self.claim_land_tile(x, y)?;
+        self.economy.budget_eur -= c;
+        let id = self.add_building(kind);
+        if let Some(b) = self.building_mut(id) {
+            b.place(x, y);
+        }
+        Ok(id)
     }
 
     pub fn set_load_kw(&mut self, kw: f64) {
@@ -184,6 +395,57 @@ impl SimState {
 
     fn building_mut(&mut self, building_id: u32) -> Option<&mut Building> {
         self.buildings.iter_mut().find(|b| b.id == building_id)
+    }
+
+    /// Une tuile est-elle occupée par un élément déjà posé ?
+    pub fn is_occupied(&self, x: u16, y: u16) -> bool {
+        if !self.map.in_bounds(x, y) {
+            return false;
+        }
+        self.occupied.get(self.map.idx(x, y)).copied().unwrap_or(false)
+    }
+
+    /// Place quelques foyers de départ (gratuits) sur des tuiles constructibles
+    /// proches du centre de la carte. Suppose la carte déjà générée ; sans effet
+    /// si la carte est vide.
+    pub fn place_starter_village(&mut self) {
+        if self.map.is_empty() {
+            return;
+        }
+        let kinds = [BuildingKind::Family, BuildingKind::Elders];
+        let mut placed = 0usize;
+        let cx = (self.map.width / 2) as i32;
+        let cy = (self.map.height / 2) as i32;
+        let max_r = self.map.width.max(self.map.height) as i32;
+        // Recherche en anneaux croissants autour du centre.
+        'outer: for r in 0..max_r {
+            for dy in -r..=r {
+                for dx in -r..=r {
+                    // Ne considère que le périmètre de l'anneau courant.
+                    if dx.abs() != r && dy.abs() != r {
+                        continue;
+                    }
+                    let x = cx + dx;
+                    let y = cy + dy;
+                    if x < 0 || y < 0 || x >= self.map.width as i32 || y >= self.map.height as i32 {
+                        continue;
+                    }
+                    let (x, y) = (x as u16, y as u16);
+                    let i = self.map.idx(x, y);
+                    if self.map.tiles[i].buildable() && !self.occupied[i] {
+                        self.occupied[i] = true;
+                        let id = self.add_building(kinds[placed]);
+                        if let Some(b) = self.building_mut(id) {
+                            b.place(x, y);
+                        }
+                        placed += 1;
+                        if placed >= kinds.len() {
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // --- Appareils & habitants (scopés par bâtiment) ---
@@ -236,10 +498,14 @@ impl SimState {
         }
 
         // 1. Production renouvelable instantanée (kW), mutualisée sur le réseau.
-        let wind_kw: f64 = self.park.wind.iter().map(|t| t.power_kw(weather.wind_ms)).sum();
+        //    Chaque actif utilise la météo **modulée par sa tuile** (terrain) :
+        //    crête ventée, versant ombragé, gros débit de rivière, etc.
+        let wind_kw: f64 = self.park.wind.iter()
+            .map(|p| p.asset.power_kw(weather.wind_ms * p.env.wind_factor)).sum();
         let solar_kw: f64 = self.park.solar.iter()
-            .map(|s| s.power_kw(weather.irradiance_kw_m2, weather.air_temp_c)).sum();
-        let hydro_kw: f64 = self.park.hydro.iter().map(|h| h.power_kw(weather.river_flow_m3s)).sum();
+            .map(|p| p.asset.power_kw(weather.irradiance_kw_m2 * p.env.solar_factor, weather.air_temp_c)).sum();
+        let hydro_kw: f64 = self.park.hydro.iter()
+            .map(|p| p.asset.power_kw(weather.river_flow_m3s * p.env.water_factor)).sum();
         let renewable_kw = wind_kw + solar_kw + hydro_kw;
 
         let net_kwh = (renewable_kw - load_kw) * dt_h;
@@ -275,6 +541,7 @@ impl SimState {
 
             for plant in &self.park.thermal {
                 if deficit <= EPS { break; }
+                let plant = &plant.asset;
                 let gen = plant.max_energy_kwh(dt_h).min(deficit);
                 deficit -= gen;
                 thermal_kwh += gen;
@@ -319,6 +586,8 @@ impl SimState {
                 id: b.id,
                 name: b.name.clone(),
                 kind: b.kind.label().to_string(),
+                x: b.x,
+                y: b.y,
                 load_kw: b.load_kw(),
                 avg_comfort_pct: b.avg_comfort_pct(),
                 resident_count: b.residents.len() as u32,
@@ -495,5 +764,94 @@ mod tests {
             s.tick(&weather(6.0, 0.0), 0.5);
         }
         assert!(s.day >= 2, "25 h écoulées -> jour 2, obtenu {}", s.day);
+    }
+
+    // --- Couche spatiale (carte + placement) ---
+
+    /// Trouve une tuile constructible et une tuile d'eau sur une petite carte.
+    fn find_tiles(s: &SimState) -> (Option<(u16, u16)>, Option<(u16, u16)>) {
+        let mut land = None;
+        let mut water = None;
+        for y in 0..s.map.height {
+            for x in 0..s.map.width {
+                let t = s.map.get(x, y).unwrap();
+                if land.is_none() && t.buildable() {
+                    land = Some((x, y));
+                }
+                if water.is_none() && t.is_water() {
+                    water = Some((x, y));
+                }
+            }
+        }
+        (land, water)
+    }
+
+    #[test]
+    fn placement_respects_terrain_and_occupancy() {
+        let mut s = SimState::new(10_000_000.0);
+        s.generate_map_sized(42, 120, 120);
+        let (land, water) = find_tiles(&s);
+        let (lx, ly) = land.expect("de la terre constructible existe");
+        let (wx, wy) = water.expect("une rivière existe");
+
+        // Solaire sur terre : OK ; rejouer sur la même tuile : occupée.
+        assert!(s.build_solar_at(lx, ly, 6.0).is_ok());
+        assert_eq!(s.build_solar_at(lx, ly, 6.0), Err(BuildError::Occupied));
+
+        // Hydro sur rivière : OK.
+        assert!(s.build_hydro_at(wx, wy).is_ok());
+
+        // Hors carte : rejeté.
+        assert_eq!(s.build_solar_at(9999, 9999, 6.0), Err(BuildError::OutOfBounds));
+    }
+
+    #[test]
+    fn hydro_only_on_water() {
+        let mut s = SimState::new(10_000_000.0);
+        s.generate_map_sized(7, 120, 120);
+        let (land, water) = find_tiles(&s);
+        let (lx, ly) = land.expect("terre");
+        assert_eq!(s.build_hydro_at(lx, ly), Err(BuildError::BadTerrain));
+        if let Some((wx, wy)) = water {
+            assert!(s.build_hydro_at(wx, wy).is_ok());
+        }
+    }
+
+    #[test]
+    fn terrain_modulates_production() {
+        // Même turbine, deux tuiles de vent différent -> productions différentes.
+        let mut s = SimState::new(10_000_000.0);
+        s.generate_map_sized(3, 120, 120);
+        // Cherche deux tuiles constructibles aux wind_factor nettement distincts.
+        let mut tiles: Vec<(u16, u16, f32)> = Vec::new();
+        for y in 0..s.map.height {
+            for x in 0..s.map.width {
+                let t = s.map.get(x, y).unwrap();
+                if t.buildable() {
+                    tiles.push((x, y, t.wind_factor));
+                }
+            }
+        }
+        tiles.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap());
+        let (lowx, lowy, lowf) = tiles.first().copied().unwrap();
+        let (hix, hiy, hif) = tiles.last().copied().unwrap();
+        assert!(hif > lowf, "il faut deux tuiles de vent différent");
+        s.build_wind_at(lowx, lowy).unwrap();
+        s.build_wind_at(hix, hiy).unwrap();
+        // Vent modéré pour rester dans la rampe (pas plafonné).
+        let w = weather(7.0, 0.0);
+        // Production de chaque éolienne via l'env capturé.
+        let p_low = s.park.wind[0].asset.power_kw(w.wind_ms * s.park.wind[0].env.wind_factor);
+        let p_hi = s.park.wind[1].asset.power_kw(w.wind_ms * s.park.wind[1].env.wind_factor);
+        assert!(p_hi >= p_low, "tuile plus ventée -> au moins autant de prod");
+    }
+
+    #[test]
+    fn off_map_build_still_works() {
+        // Les constructeurs non spatiaux fonctionnent sans carte (env neutre).
+        let mut s = SimState::new(10_000_000.0);
+        s.build_wind(WindTurbine::onshore_2mw());
+        let r = s.tick(&weather(13.0, 0.0), 1.0);
+        assert!(r.wind_kw > 0.0);
     }
 }

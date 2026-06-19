@@ -68,6 +68,9 @@ pub struct Building {
     pub id: u32,
     pub kind: BuildingKind,
     pub name: String,
+    /// Position sur la carte (tuile). `(0, 0)` tant que non placé sur la carte.
+    pub x: u16,
+    pub y: u16,
     /// Appareils consommateurs installés dans ce bâtiment.
     pub appliances: Vec<Appliance>,
     /// Habitants qui pilotent les appareils au fil de la journée.
@@ -81,7 +84,22 @@ impl Building {
     /// reçoivent des ids alloués par l'appelant pour rester uniques dans le
     /// village.
     pub fn new(id: u32, kind: BuildingKind, name: impl Into<String>) -> Self {
-        Self { id, kind, name: name.into(), appliances: Vec::new(), residents: Vec::new(), load_kw: 0.0 }
+        Self {
+            id,
+            kind,
+            name: name.into(),
+            x: 0,
+            y: 0,
+            appliances: Vec::new(),
+            residents: Vec::new(),
+            load_kw: 0.0,
+        }
+    }
+
+    /// Positionne le bâtiment sur une tuile de la carte.
+    pub fn place(&mut self, x: u16, y: u16) {
+        self.x = x;
+        self.y = y;
     }
 
     /// Crée un bâtiment avec son loadout par défaut (appareils + habitants).
@@ -163,6 +181,8 @@ pub struct BuildingReport {
     pub id: u32,
     pub name: String,
     pub kind: String,
+    pub x: u16,
+    pub y: u16,
     pub load_kw: f64,
     pub avg_comfort_pct: f64,
     pub resident_count: u32,

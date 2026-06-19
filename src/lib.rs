@@ -22,6 +22,7 @@
 pub mod appliance;
 pub mod building;
 pub mod economy;
+pub mod map;
 pub mod physics;
 pub mod resident;
 pub mod sim;
@@ -34,11 +35,12 @@ pub mod wasm;
 pub use appliance::{Appliance, ApplianceKind};
 pub use building::{Building, BuildingKind, BuildingReport};
 pub use economy::{Economy, Grid};
+pub use map::{Ground, TerrainMap, TerrainTile, MAP_H, MAP_W};
 pub use physics::{
     wind_at_height, FuelKind, HydroKind, HydroTurbine, SolarArray, ThermalPlant, WindTurbine,
     AIR_DENSITY, BETZ_LIMIT, GRAVITY, WATER_DENSITY,
 };
 pub use resident::{Resident, ResidentProfile};
-pub use sim::{Park, SimState, TickReport};
+pub use sim::{BuildError, Park, Placed, SimState, TileEnv, TickReport};
 pub use storage::Battery;
 pub use weather::{ProceduralWeather, Weather};
