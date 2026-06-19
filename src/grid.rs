@@ -27,12 +27,26 @@
 use serde::{Deserialize, Serialize};
 
 use crate::sim::Park;
-use crate::weather::Weather;
+use crate::weather::{Rng, Weather};
 
 /// Identifiant d'un nœud dans l'arène (indice dans `Grid::nodes`).
 pub type NodeId = u32;
 
 const EPS: f64 = 1e-6;
+
+/// Heures par an (pour annualiser les économies d'auto-production).
+const HOURS_PER_YEAR: f64 = 8760.0;
+/// Facteur de charge solaire moyen (France ~13 %) pour estimer le productible.
+const SOLAR_CF: f64 = 0.13;
+/// Facteur de charge éolien domestique moyen (~20 %).
+const WIND_CF: f64 = 0.20;
+/// Premier palier de toiture solaire installé par un foyer NPC (kWc).
+const NPC_SOLAR_KWC: f64 = 6.0;
+/// Palier de batterie domestique (kWh).
+const NPC_BATTERY_KWH: f64 = 10.0;
+/// Horizon de payback de base accepté par un foyer (années), avant l'effet
+/// d'`autonomy_pref` qui le rend plus patient/agressif.
+const NPC_PAYBACK_YEARS: f64 = 8.0;
 
 /// Échelle d'un nœud du réseau.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,6 +125,10 @@ pub struct GridNode {
     /// 0 = « branche-moi au réseau », 1 = « je veux l'autonomie ». Réduit la part
     /// d'import qu'un nœud accepte (il préfère risquer la coupure que dépendre).
     pub autonomy_pref: f64,
+    /// Revenu propre du nœud (€/jour) : pour une maison, la somme des
+    /// salaires/pensions de ses résidents. Crédité au portefeuille à chaque pas
+    /// et finance l'auto-investissement des foyers NPC.
+    pub income_eur_per_day: f64,
     pub wallet: Wallet,
     /// Connexion vers le parent. `None` pour la racine.
     pub uplink: Option<Link>,
@@ -129,6 +147,7 @@ impl GridNode {
             park: Park::default(),
             load_kw: 0.0,
             autonomy_pref: 0.0,
+            income_eur_per_day: 0.0,
             wallet: Wallet::new(0.0),
             uplink: None,
             parent: None,
@@ -187,6 +206,25 @@ impl NodeReport {
     }
 }
 
+/// Indicateurs agrégés du réseau pour l'UI : ils rendent la **spirale de la
+/// mort** visible. Calculés à partir des `NodeReport` d'un pas.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct GridSummary {
+    /// Marge nette du national sur le pas (€) : son cash-flow. Devient négative
+    /// quand son revenu (marges import/export) ne couvre plus ses coûts fixes.
+    pub national_margin_eur: f64,
+    pub national_balance_eur: f64,
+    /// Taux de dépendance au réseau (0..1) : part de la charge des maisons
+    /// couverte par un **import** (depuis le quartier/national) plutôt qu'en
+    /// propre ou en P2P. Il s'effondre quand les foyers s'autonomisent.
+    pub dependency_rate: f64,
+    pub total_load_kw: f64,
+    pub total_import_kw: f64,
+    /// Nombre de maisons et combien ont déjà de l'auto-production.
+    pub households: u32,
+    pub self_producing_households: u32,
+}
+
 /// L'arbre complet du réseau.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Grid {
@@ -194,6 +232,10 @@ pub struct Grid {
     /// La racine (le national).
     pub root: NodeId,
     pub tick_count: u64,
+    /// Heures simulées cumulées (cadence des décisions journalières NPC).
+    pub sim_hours: f64,
+    /// Dernier jour où l'auto-investissement NPC a été évalué.
+    last_invest_day: u32,
 }
 
 impl Grid {
@@ -201,7 +243,7 @@ impl Grid {
     pub fn new_national(name: impl Into<String>, starting_balance_eur: f64) -> Self {
         let mut root = GridNode::new(0, Tier::National, name);
         root.wallet = Wallet::new(starting_balance_eur);
-        Self { nodes: vec![root], root: 0, tick_count: 0 }
+        Self { nodes: vec![root], root: 0, tick_count: 0, sim_hours: 0.0, last_invest_day: 0 }
     }
 
     /// Ajoute un enfant sous `parent`, raccordé par `link`. Renvoie son `NodeId`.
@@ -246,6 +288,36 @@ impl Grid {
         self.nodes[id as usize].islanded()
     }
 
+    /// Calcule les [indicateurs de spirale](GridSummary) à partir des rapports
+    /// d'un pas. Le `dependency_rate` agrège les maisons : import / charge.
+    pub fn summary(&self, reports: &[NodeReport]) -> GridSummary {
+        let mut s = GridSummary {
+            national_margin_eur: reports[self.root as usize].cash_flow_eur,
+            national_balance_eur: reports[self.root as usize].balance_eur,
+            ..Default::default()
+        };
+        for (n, r) in self.nodes.iter().zip(reports.iter()) {
+            if n.tier != Tier::Household {
+                continue;
+            }
+            s.households += 1;
+            s.total_load_kw += r.load_kw;
+            s.total_import_kw += r.import_kw;
+            let self_equipped = !n.park.solar.is_empty()
+                || !n.park.wind.is_empty()
+                || n.park.battery.is_some();
+            if self_equipped {
+                s.self_producing_households += 1;
+            }
+        }
+        s.dependency_rate = if s.total_load_kw > EPS {
+            (s.total_import_kw / s.total_load_kw).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        s
+    }
+
     /// Avance le réseau d'un pas `dt_h` : équilibre tout l'arbre en deux passes et
     /// renvoie un [`NodeReport`] par nœud (indexé par `NodeId`).
     pub fn tick(&mut self, dt_h: f64) -> Vec<NodeReport> {
@@ -268,15 +340,115 @@ impl Grid {
             }
         }
 
-        // Finalise cash-flow, solde et état de charge par nœud.
+        // Coûts fixes (OPEX lignes + centrales) et revenus propres (salaires des
+        // résidents) de chaque nœud, prorata du pas. Les coûts fixes drainent le
+        // portefeuille même sans vente : c'est le moteur de la « spirale ».
+        let day_frac = dt_h / 24.0;
+        for n in &mut self.nodes {
+            n.wallet.balance_eur -= n.wallet.fixed_cost_eur_per_day * day_frac;
+            n.wallet.balance_eur += n.income_eur_per_day * day_frac;
+        }
+
+        // Finalise cash-flow, solde et état de charge par nœud (avant les
+        // décisions d'investissement, qui relèvent du CAPEX, pas de l'OPEX).
         for (i, n) in self.nodes.iter().enumerate() {
             reports[i].cash_flow_eur = n.wallet.balance_eur - before[i];
             reports[i].balance_eur = n.wallet.balance_eur;
             reports[i].soc_pct = n.park.battery.as_ref().map(|b| b.soc_pct()).unwrap_or(0.0);
         }
 
+        // Horloge + décision d'auto-investissement NPC à cadence journalière.
+        self.sim_hours += dt_h;
+        let day = (self.sim_hours / 24.0).floor() as u32;
+        if day != self.last_invest_day {
+            self.last_invest_day = day;
+            self.npc_invest_step();
+        }
+
         self.tick_count += 1;
         reports
+    }
+
+    /// Décision d'auto-investissement des **foyers NPC** (cadence journalière).
+    /// Parcourt les maisons en ordre d'indice (déterministe) et tente le prochain
+    /// palier d'équipement de chacune.
+    fn npc_invest_step(&mut self) {
+        for i in 0..self.nodes.len() {
+            if self.nodes[i].tier == Tier::Household {
+                self.try_invest(i as NodeId);
+            }
+        }
+    }
+
+    /// Heuristique d'auto-investissement d'un foyer : il estime les imports
+    /// **évités** au tarif courant si l'on ajoutait le prochain palier (toiture
+    /// solaire → batterie → micro-éolienne) et investit si
+    /// `économies_annualisées × horizon_payback ≥ coût` **et** `solde ≥ coût`.
+    /// `autonomy_pref` allonge l'horizon accepté → décrochage plus agressif.
+    /// Renvoie `true` si un palier a été acheté.
+    fn try_invest(&mut self, id: NodeId) -> bool {
+        use crate::economy::capex_wind;
+        use crate::physics::WindTurbine;
+
+        let node = &self.nodes[id as usize];
+        let import_price = node.uplink.as_ref().map(|l| l.import_price_eur_kwh).unwrap_or(0.0);
+        let autonomy = node.autonomy_pref.clamp(0.0, 1.0);
+        let balance = node.wallet.balance_eur;
+        let solar_kwc: f64 = node.park.solar.iter().map(|p| p.asset.kwc).sum();
+        let has_battery = node.park.battery.is_some();
+        let has_wind = !node.park.wind.is_empty();
+        let payback_target = NPC_PAYBACK_YEARS * (1.0 + autonomy);
+
+        // Économies annuelles d'un productible (kWh/an) au tarif d'import courant.
+        let savings = |annual_kwh: f64| annual_kwh * import_price;
+        let worth_it = |cost: f64, annual_kwh: f64| {
+            balance >= cost && savings(annual_kwh) * payback_target >= cost
+        };
+
+        // Palier 1 : toiture solaire (tant qu'on n'en a pas).
+        if solar_kwc < NPC_SOLAR_KWC - EPS {
+            let cost = NPC_SOLAR_KWC * 1100.0;
+            let annual = NPC_SOLAR_KWC * SOLAR_CF * HOURS_PER_YEAR;
+            return worth_it(cost, annual) && self.build_solar(id, NPC_SOLAR_KWC);
+        }
+        // Palier 2 : batterie domestique (auto-consommation du surplus solaire).
+        if !has_battery {
+            let cost = NPC_BATTERY_KWH * 600.0;
+            // ~1 cycle/jour de la part utile (80 %) de la capacité.
+            let annual = NPC_BATTERY_KWH * 0.8 * 300.0;
+            return worth_it(cost, annual) && self.build_battery(id, NPC_BATTERY_KWH);
+        }
+        // Palier 3 : micro-éolienne de jardin.
+        if !has_wind {
+            let t = WindTurbine::micro();
+            let cost = capex_wind(&t);
+            let annual = t.rated_kw * WIND_CF * HOURS_PER_YEAR;
+            return worth_it(cost, annual) && self.build_wind_micro(id);
+        }
+        false
+    }
+
+    /// **Foisonnement** : propage une météo de base à tous les nœuds en y
+    /// ajoutant un **bruit déterministe décorrélé** par nœud (seedé sur l'id et
+    /// le tick). Les variances locales étant indépendantes, un parent qui agrège
+    /// de nombreux enfants voit un résidu plus lisse → une maison isolée subit
+    /// toute la variance, le national la moyenne. `amplitude` ∈ 0..1 module
+    /// l'écart relatif appliqué au vent et à l'irradiance.
+    pub fn propagate_weather(&mut self, base: Weather, amplitude: f64) {
+        let amp = amplitude.clamp(0.0, 1.0);
+        let tick = self.tick_count;
+        for n in &mut self.nodes {
+            // Graine stable par (nœud, tick) : reproductible, sans HashMap.
+            let seed = (n.id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ tick.wrapping_add(1);
+            let mut rng = Rng::new(seed.max(1));
+            // Bruit centré dans [-amp, +amp].
+            let nw = (rng.next_f64() - 0.5) * 2.0 * amp;
+            let ni = (rng.next_f64() - 0.5) * 2.0 * amp;
+            let mut w = base;
+            w.wind_ms = (base.wind_ms * (1.0 + nw)).max(0.0);
+            w.irradiance_kw_m2 = (base.irradiance_kw_m2 * (1.0 + ni)).max(0.0);
+            n.weather = w;
+        }
     }
 
     /// Équilibre récursivement le sous-arbre enraciné en `id` et renvoie son
@@ -668,5 +840,112 @@ mod tests {
         assert!(rd[h1 as usize].import_kw > ra[h2 as usize].import_kw, "l'autonome importe moins");
         assert!(ra[h2 as usize].unmet_kw > 0.0, "l'autonome subit du non-fourni");
         assert!(!rd[h1 as usize].blackout, "le dépendant est servi");
+    }
+
+    // --- Phase 2 : économie, coûts fixes, NPC, spirale, foisonnement ---
+
+    /// Météo ensoleillée constante (pour un solaire productif et déterministe).
+    fn daylight() -> Weather {
+        Weather { wind_ms: 0.0, irradiance_kw_m2: 0.6, air_temp_c: 20.0, river_flow_m3s: 0.0 }
+    }
+
+    /// National (gros charbon) → 1 quartier → `n` maisons consommatrices au tarif
+    /// d'import `import_price`. Chaque maison a un revenu et de la trésorerie.
+    fn spiral_grid(import_price: f64, n: usize) -> (Grid, Vec<NodeId>) {
+        let mut g = Grid::new_national("National", 5_000_000.0);
+        // De quoi alimenter tout le monde si personne ne s'autoproduit.
+        g.node_mut(g.root).park.add_thermal(ThermalPlant::new(FuelKind::Coal, 100_000.0));
+        let district = g.add_child(g.root, Tier::District, "Quartier", link(import_price, import_price * 0.5));
+        g.node_mut(district).wallet = Wallet::new(50_000.0);
+        let mut houses = Vec::new();
+        for i in 0..n {
+            let h = g.add_child(district, Tier::Household, format!("Maison {i}"), link(import_price, import_price * 0.5));
+            let node = g.node_mut(h);
+            node.wallet = Wallet::new(10_000.0);
+            node.income_eur_per_day = 90.0;
+            node.load_kw = 3.0;
+            node.weather = daylight();
+            houses.push(h);
+        }
+        (g, houses)
+    }
+
+    #[test]
+    fn fixed_cost_drains_wallet() {
+        // Un nœud aux coûts fixes, sans revenu ni vente, voit son solde fondre.
+        let mut g = Grid::new_national("National", 10_000.0);
+        g.node_mut(g.root).wallet.fixed_cost_eur_per_day = 1_200.0;
+        let start = g.node(g.root).wallet.balance_eur;
+        for _ in 0..48 {
+            g.tick(1.0); // 48 h
+        }
+        let end = g.node(g.root).wallet.balance_eur;
+        // 2 jours × 1200 €/j ≈ 2400 € prélevés.
+        assert!((start - end - 2_400.0).abs() < 1.0, "les coûts fixes drainent ({start} -> {end})");
+    }
+
+    #[test]
+    fn high_tariff_triggers_npc_investment() {
+        // Tarif élevé : la maison investit dans le solaire (payback favorable).
+        // Tarif bas : elle reste branchée au réseau, n'investit pas.
+        let mut high = spiral_grid(0.30, 1).0;
+        let mut low = spiral_grid(0.08, 1).0;
+        for _ in 0..48 {
+            // 2 jours -> au moins un passage de jour (décision NPC).
+            high.tick(1.0);
+            low.tick(1.0);
+        }
+        let high_solar = high.nodes.iter().any(|n| n.tier == Tier::Household && !n.park.solar.is_empty());
+        let low_solar = low.nodes.iter().any(|n| n.tier == Tier::Household && !n.park.solar.is_empty());
+        assert!(high_solar, "tarif élevé -> la maison s'équipe en solaire");
+        assert!(!low_solar, "tarif bas -> la maison ne s'équipe pas");
+    }
+
+    #[test]
+    fn death_spiral_lowers_dependency_and_national_revenue() {
+        // Cœur de la tension politique : un tarif élevé pousse les foyers à
+        // s'autonomiser, ce qui effondre la dépendance au réseau ET le revenu que
+        // le national tire de leurs imports.
+        let run = |import_price: f64| {
+            let (mut g, _houses) = spiral_grid(import_price, 3);
+            // Marge nationale au tout premier pas (avant tout investissement).
+            let r0 = g.tick(1.0);
+            let margin_before = g.summary(&r0).national_margin_eur;
+            // Plusieurs jours : les NPC décident, la spirale s'installe.
+            let mut last = Vec::new();
+            for _ in 0..(24 * 6) {
+                last = g.tick(1.0);
+            }
+            let s = g.summary(&last);
+            (margin_before, s)
+        };
+        let (margin_before_high, high) = run(0.30);
+        let (_margin_before_low, low) = run(0.08);
+
+        // À tarif bas, personne ne décroche ; à tarif élevé, tout le monde.
+        assert_eq!(low.self_producing_households, 0, "tarif bas -> aucun décrochage");
+        assert_eq!(high.self_producing_households, 3, "tarif élevé -> les 3 maisons décrochent");
+        // La dépendance au réseau s'effondre côté tarif élevé.
+        assert!(high.dependency_rate < low.dependency_rate, "spirale : dépendance en baisse ({} < {})", high.dependency_rate, low.dependency_rate);
+        assert!(high.dependency_rate < 0.2, "les foyers autoproduisent l'essentiel ({})", high.dependency_rate);
+        // Le revenu que le national tire des imports s'effondre après décrochage.
+        assert!(high.national_margin_eur < margin_before_high, "la marge nationale chute après décrochage ({} < {})", high.national_margin_eur, margin_before_high);
+    }
+
+    #[test]
+    fn foisonnement_is_deterministic_and_decorrelated() {
+        let base = Weather { wind_ms: 8.0, irradiance_kw_m2: 0.5, air_temp_c: 15.0, river_flow_m3s: 2.0 };
+        let (mut a, ..) = small_grid();
+        let (mut b, ..) = small_grid();
+        a.propagate_weather(base, 0.3);
+        b.propagate_weather(base, 0.3);
+        // Reproductible : même graine -> même météo par nœud.
+        for (na, nb) in a.nodes.iter().zip(b.nodes.iter()) {
+            assert_eq!(na.weather.wind_ms.to_bits(), nb.weather.wind_ms.to_bits());
+            assert_eq!(na.weather.irradiance_kw_m2.to_bits(), nb.weather.irradiance_kw_m2.to_bits());
+        }
+        // Décorrélé : au moins deux nœuds ont une météo différente.
+        let winds: Vec<f64> = a.nodes.iter().map(|n| n.weather.wind_ms).collect();
+        assert!(winds.windows(2).any(|w| (w[0] - w[1]).abs() > 1e-9), "les nœuds ne sont pas tous identiques");
     }
 }
