@@ -1,6 +1,7 @@
 // Façade typée autour du module WASM généré par wasm-pack dans `./pkg`.
-// `init()` charge le .wasm ; `Game` est la struct exposée par src/wasm.rs.
-import init, { Game } from "./pkg/energy_core.js";
+// `init()` charge le .wasm ; `Game` (mono-carte) et `GridGame` (réseau
+// multi-couches) sont les structs exposées par src/wasm.rs.
+import init, { Game, GridGame } from "./pkg/energy_core.js";
 
 let ready: Promise<void> | null = null;
 
@@ -10,9 +11,18 @@ export function initEngine(): Promise<void> {
   return ready;
 }
 
-/** Instancie une partie : budget en €, graine météo déterministe. */
+/** Instancie une partie mono-carte : budget en €, graine météo déterministe. */
 export function createGame(budget: number, seed: number): Game {
   return new Game(budget, seed);
 }
 
-export type { Game };
+/** Instancie un réseau multi-couches : 1 national → quartiers → maisons. */
+export function createGridGame(
+  seed: number,
+  nDistricts: number,
+  housesPerDistrict: number,
+): GridGame {
+  return new GridGame(seed, nDistricts, housesPerDistrict);
+}
+
+export type { Game, GridGame };

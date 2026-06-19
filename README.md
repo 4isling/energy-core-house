@@ -28,9 +28,55 @@ src/
 ├── economy.rs    CAPEX/OPEX, émissions, réseau (import/export prix spot)
 ├── appliance.rs  Appliance : appareils consommateurs (frigo, four, VE…)
 ├── resident.rs   Resident : habitants (NPC) + routines journalières
-├── sim.rs        Park + SimState + tick() : dispatch merit-order
-└── wasm.rs       Façade wasm-bindgen (feature "wasm")
+├── sim.rs        Park + SimState + tick() : dispatch merit-order (mono-carte)
+├── grid.rs       Réseau MULTI-COUCHES : Grid/GridNode/Link/Wallet, dispatch
+│                 récursif deux passes, P2P, îlotage, NPC, spirale
+└── wasm.rs       Façade wasm-bindgen : Game (mono-carte) + GridGame (réseau)
 ```
+
+### Réseau énergétique multi-couches (national / quartier / maison)
+
+Au-dessus du jeu mono-carte, `grid.rs` modélise le réseau comme une **hiérarchie
+de nœuds** calquée sur le réel : maison → poste de quartier → réseau national.
+Un seul type, [`GridNode`], s'emboîte à toutes les échelles ; l'arbre vit dans
+une **arène** (`Vec<GridNode>` + indices `NodeId`), sérialisable et déterministe.
+
+**Dispatch en deux passes**, par tick, pour chaque nœud (`balance` récursif) :
+
+1. **Équilibrage local** — renouvelable + batterie locale (`Park::balance_local`).
+2. **Descente récursive** — on équilibre d'abord chaque enfant.
+3. **Troc P2P** — au niveau du parent, on apparie surplus et déficits des enfants
+   (le micro-réseau de quartier : le voisin qui a trop de solaire alimente celui
+   qui en manque), avec règlement à un **prix local** entre import et export.
+4. **Échange par `Link`** — le résidu de chaque enfant remonte (capacité, pertes
+   en ligne, règlement monétaire **à contre-sens de l'énergie**). `autonomy_pref`
+   réduit la part qu'un enfant accepte d'importer.
+5. **Couverture** — si le pool agrégé est en déficit, le nœud lance ses centrales
+   pilotables (`Park::cover_with_thermal`).
+6. **Résidu** — ce qui reste monte au parent via l'`uplink` ; la racine couvre
+   son déficit (black-out sinon) ou écrête (curtailment) son surplus.
+
+**Économie & spirale de la mort.** Chaque nœud a un `Wallet` : l'argent circule à
+contre-sens de l'énergie (qui importe paie, qui exporte touche), et des **coûts
+fixes** drainent le portefeuille quoi qu'il arrive. Le tarif national est un
+levier joueur : l'augmenter améliore le revenu par kWh… mais rend
+l'**autoproduction** des foyers plus rentable. Les maisons NPC s'auto-équipent
+alors (toiture solaire → batterie → micro-éolienne) selon le payback au tarif
+courant → leurs imports s'effondrent → le revenu du national fond alors que ses
+coûts fixes restent : la **spirale de la mort** émerge de la mécanique, sans être
+scriptée (`GridSummary` expose la marge nationale et le taux de dépendance).
+**Îlotage** : un nœud peut se déconnecter de son parent (`Link.connected`) et
+survivre sur sa prod — un quartier bien équipé tient même si le national tombe.
+
+**Foisonnement** : `Grid::propagate_weather` éclate la météo de base en un bruit
+**décorrélé par nœud** (seedé) ; une maison isolée subit toute la variance, alors
+qu'un parent agrégeant de nombreux enfants la lisse — l'autonomie a un prix réel.
+
+Le front web propose un **sélecteur de mode** : « Village » (mono-carte, existant)
+et « Réseau » (multi-couches) avec navigation drill-down National ⇄ Quartier ⇄
+Maison, panneau de spirale + tarif au national, gestion des actifs partagés au
+quartier, et inspecteur de maison (les foyers NPC décident ; on les influence par
+le tarif).
 
 ### Jeu « village micro-réseau »
 
@@ -100,6 +146,24 @@ setInterval(() => {
 Pour brancher de **vraies données** (CSV éCO2mix / Météo-France / PVGIS /
 Hub'Eau) au lieu de la météo procédurale, utilise `tick_with_weather(dt, wind,
 irradiance, temp, flow)` et `set_spot_price(...)` alimentés depuis tes datasets.
+
+### Réseau multi-couches via `GridGame`
+
+```js
+import init, { GridGame } from "./pkg/energy_core.js";
+
+await init();
+const grid = new GridGame(1234, 3, 4);   // seed, 3 quartiers, 4 maisons chacun
+
+grid.set_national_tariff(0.30, 0.10);    // tarif élevé → pousse au décrochage
+grid.island_node(1, true);               // îlote le quartier #1 (résilience)
+
+setInterval(() => {
+  const reports = grid.tick(0.5);        // un NodeReport par nœud (objets JS)
+  const s = grid.summary();              // marge nationale, taux de dépendance…
+  render(reports, s, grid.nodes());      // grid.nodes() = arbre pour le drill-down
+}, 250);
+```
 
 ## Calibrer avec les données France
 
